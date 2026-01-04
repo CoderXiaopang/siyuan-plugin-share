@@ -2,7 +2,7 @@
   "name": "siyuan-plugin-share",
   "author": "取舍",
   "url": "https://github.com/b8l8u8e8/siyuan-plugin-share",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "minAppVersion": "2.9.0",
   "disabledInPublish": true,
   "backends": [
@@ -16,8 +16,8 @@
     "zh_CN": "思源分享"
   },
   "description": {
-    "default": "Free sharing of notebooks or documents as links, with support for setting passwords and expiration times.",
-    "zh_CN": "免费分享笔记本或某文档为链接,支持设置密码和到期时间。"
+    "default": "This is a free sharing plugin for SiYuan Note. It supports generating share links for notebooks or documents, allowing you to set access passwords and expiration dates.",
+    "zh_CN": "一款免费的思源笔记分享插件，支持将笔记本或文档生成分享链接，并支持设置访问密码及有效期。"
   },
   "readme": {
     "default": "README.md",

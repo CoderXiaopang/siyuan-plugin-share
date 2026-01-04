@@ -1,8 +1,8 @@
-# Siyuan Share
+﻿# Siyuan Share
 
 This is a free sharing plugin for SiYuan Note. It supports generating share links for notebooks or documents, allowing you to set access passwords and expiration dates.
 
-[中文](README_zh_CN.md) | [English](README.md)
+[中文](https://github.com/b8l8u8e8/siyuan-plugin-share/blob/main/README_zh_CN.md) | [English](https://github.com/b8l8u8e8/siyuan-plugin-share/blob/main/README.md)
 
 ## ✨ Usage
 
@@ -79,3 +79,4 @@ If you find this project helpful, your support is welcome! It encourages me to k
 - **Feedback**: [GitHub Issues](https://github.com/b8l8u8e8/siyuan-plugin-share/issues)
 - **License**: [MIT License](https://github.com/b8l8u8e8/siyuan-plugin-share/blob/main/LICENSE)
 - **Changelog**: [CHANGELOG.md](https://github.com/b8l8u8e8/siyuan-plugin-share/blob/main/CHANGELOG.md)
+
