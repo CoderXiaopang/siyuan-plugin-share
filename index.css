@@ -5,6 +5,15 @@
   padding: 12px;
   width: 100%;
   min-width: 0;
+  box-sizing: border-box;
+}
+
+.siyuan-plugin-share * {
+  box-sizing: border-box;
+}
+
+.sps-dialog-body {
+  max-width: 100%;
 }
 
 .siyuan-plugin-share__section {
@@ -193,11 +202,6 @@
   background: var(--b3-theme-primary);
   border-radius: 999px;
   animation: sps-progress-indeterminate 1.1s ease-in-out infinite;
-}
-
-.sps-progress__actions {
-  display: flex;
-  justify-content: flex-end;
 }
 
 @keyframes sps-progress-indeterminate {

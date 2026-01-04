@@ -41,6 +41,22 @@ const TREE_SHARE_CLASS = "sps-tree-share";
 const TREE_SHARED_CLASS = "sps-tree-item--shared";
 const TREE_SHARE_ICON_ID = "iconSiyuanShare";
 
+let globalI18nProvider = null;
+
+function setGlobalI18nProvider(provider) {
+  globalI18nProvider = typeof provider === "function" ? provider : null;
+}
+
+function tGlobal(key, vars) {
+  if (globalI18nProvider) return globalI18nProvider(key, vars);
+  if (!vars) return key;
+  return key.replace(/\{(\w+)\}/g, (match, name) => {
+    if (!Object.prototype.hasOwnProperty.call(vars, name)) return match;
+    const value = vars[name];
+    return value == null ? "" : String(value);
+  });
+}
+
 function getAPIToken() {
   try {
     const token = globalThis?.siyuan?.config?.api?.token;
@@ -90,9 +106,9 @@ function parseDateTimeLocalInput(value) {
   return Number.isFinite(ts) ? ts : null;
 }
 
-function throwIfAborted(controller) {
+function throwIfAborted(controller, message) {
   if (controller?.signal?.aborted) {
-    throw new Error("已取消操作");
+    throw new Error(message || "Operation cancelled.");
   }
 }
 
@@ -555,12 +571,14 @@ function joinFsPath(base, ...parts) {
 
 async function resolveWorkspaceRoot(publishRootInput) {
   const wsInfo = await fetchSyncPost("/api/system/getWorkspaceInfo", {});
-  if (!wsInfo || wsInfo.code !== 0) throw new Error(wsInfo?.msg || "获取工作区信息失败");
+  if (!wsInfo || wsInfo.code !== 0) {
+    throw new Error(wsInfo?.msg || tGlobal("siyuanShare.error.workspaceInfoFailed"));
+  }
   const workspaceDir = wsInfo?.data?.workspaceDir;
-  if (!workspaceDir) throw new Error("无法获取工作区路径");
+  if (!workspaceDir) throw new Error(tGlobal("siyuanShare.error.workspacePathFailed"));
 
   const inputRaw = String(publishRootInput || "").trim();
-  if (!inputRaw) throw new Error("请先设置发布目录");
+  if (!inputRaw) throw new Error(tGlobal("siyuanShare.error.publishDirRequired"));
   const inputNorm = inputRaw.replace(/\\/g, "/").replace(/\/+$/, "");
 
   const wsNorm = String(workspaceDir).replace(/\\/g, "/").replace(/\/+$/, "");
@@ -578,11 +596,13 @@ async function resolveWorkspaceRoot(publishRootInput) {
       const rel = inputNorm.slice(wsNorm.length) || "/";
       return {workspaceDir, rootRel: rel.startsWith("/") ? rel : `/${rel}`};
     }
-    throw new Error(`发布目录必须位于工作区内，例如 /public/share\n当前工作区：${workspaceDir}`);
+    throw new Error(
+      tGlobal("siyuanShare.error.publishDirOutsideWorkspace", {workspace: workspaceDir}),
+    );
   }
 
   const rel = normalizeWorkspaceRelPath(inputNorm);
-  if (rel.includes("..")) throw new Error("发布目录不能包含 ..");
+  if (rel.includes("..")) throw new Error(tGlobal("siyuanShare.error.publishDirInvalid"));
   return {workspaceDir, rootRel: rel};
 }
 
@@ -604,15 +624,17 @@ async function putWorkspaceFile(workspacePath, content, filename = "index.html",
   });
   const json = await resp.json().catch(() => null);
   if (!resp.ok) {
-    throw new Error(json?.msg || `写入文件失败 (${resp.status})`);
+    throw new Error(
+      json?.msg || tGlobal("siyuanShare.error.writeFileFailedStatus", {status: resp.status}),
+    );
   }
   if (json?.code !== 0) {
-    throw new Error(json?.msg || "写入文件失败");
+    throw new Error(json?.msg || tGlobal("siyuanShare.error.writeFileFailed"));
   }
 }
 
 async function safeRm(dirPath) {
-  if (!fs) throw new Error("Node.js fs 不可用，请检查运行环境");
+  if (!fs) throw new Error(tGlobal("siyuanShare.error.nodeFsUnavailable"));
   const fsp = fs.promises;
   if (fsp.rm) {
     await fsp.rm(dirPath, {recursive: true, force: true});
@@ -788,10 +810,27 @@ class SiYuanSharePlugin extends Plugin {
     this.settingLayoutObserver = null;
   }
 
+  t(key, vars) {
+    const text = this.i18n?.[key] ?? key;
+    if (!vars) return text;
+    return text.replace(/\{(\w+)\}/g, (match, name) => {
+      if (!Object.prototype.hasOwnProperty.call(vars, name)) return match;
+      const value = vars[name];
+      return value == null ? "" : String(value);
+    });
+  }
+
+  notify(message, ...rest) {
+    const prefix = this.displayName || this.name || "SiYuan Share";
+    const text = prefix ? `${prefix}: ${message}` : message;
+    showMessage(text, ...rest);
+  }
+
   onload() {
+    setGlobalI18nProvider(this.t.bind(this));
     this.loadState().catch((err) => {
       console.error(err);
-      showMessage(`插件初始化失败：${err.message || err}`);
+      this.notify(this.t("siyuanShare.message.pluginInitFailed", {error: err.message || err}));
     });
 
     this.addIcons(`<symbol id="iconSiyuanShare" viewBox="0 0 24 24">
@@ -816,6 +855,7 @@ class SiYuanSharePlugin extends Plugin {
   }
 
   onunload() {
+    setGlobalI18nProvider(null);
     if (this.dockElement) {
       this.dockElement.removeEventListener("click", this.onDockClick);
     }
@@ -1180,6 +1220,7 @@ class SiYuanSharePlugin extends Plugin {
   }
 
   async openShareDialogFor({type = SHARE_TYPES.DOC, id = "", title = ""} = {}) {
+    const t = this.t.bind(this);
     const itemType = type === SHARE_TYPES.NOTEBOOK ? SHARE_TYPES.NOTEBOOK : SHARE_TYPES.DOC;
     let itemId = String(id || "").trim();
     if (!itemId && itemType === SHARE_TYPES.DOC) {
@@ -1191,7 +1232,7 @@ class SiYuanSharePlugin extends Plugin {
       itemId = this.currentDoc.id;
     }
     if (!itemId) {
-      showMessage("未检测到当前文档，请先打开文档。");
+      this.notify(t("siyuanShare.message.noCurrentDoc"));
       return;
     }
 
@@ -1199,88 +1240,101 @@ class SiYuanSharePlugin extends Plugin {
     if (itemType === SHARE_TYPES.DOC) {
       if (!itemTitle || itemTitle === itemId) {
         const info = await this.resolveDocInfoFromAnyId(itemId);
-                itemTitle = info?.title || itemTitle || "(???)";
+        itemTitle = info?.title || itemTitle || t("siyuanShare.label.unknown");
       }
     } else {
       if (!this.notebooks.length) {
         await this.refreshNotebookOptions({silent: true});
       }
       const notebook = this.notebooks.find((n) => n.id === itemId);
-            itemTitle = notebook?.name || itemTitle || "(???)";
+      itemTitle = notebook?.name || itemTitle || t("siyuanShare.label.unknown");
     }
 
     const share =
       itemType === SHARE_TYPES.NOTEBOOK ? this.getShareByNotebookId(itemId) : this.getShareByDocId(itemId);
     const url = share ? this.getShareUrl(share) : "";
-    const typeLabel = itemType === SHARE_TYPES.NOTEBOOK ? "笔记本" : "文档";
+    const typeLabel =
+      itemType === SHARE_TYPES.NOTEBOOK ? t("siyuanShare.label.notebook") : t("siyuanShare.label.document");
     const hasPassword = !!share?.hasPassword;
     const expiresAt = normalizeTimestampMs(share?.expiresAt || 0);
     const expiresInputValue = expiresAt ? toDateTimeLocalInput(expiresAt) : "";
-    const currentPasswordLabel = hasPassword ? "已设置访问密码" : "未设置访问密码";
-    const currentExpiresLabel = expiresAt ? this.formatTime(expiresAt) : "未设置到期时间";
+    const currentPasswordLabel = hasPassword
+      ? t("siyuanShare.label.passwordSet")
+      : t("siyuanShare.label.passwordNotSet");
+    const currentExpiresLabel = expiresAt ? this.formatTime(expiresAt) : t("siyuanShare.label.expiresNotSet");
     const passwordKeepToken = "__KEEP__";
     const passwordInputValue = share && hasPassword ? passwordKeepToken : "";
     const passwordPlaceholder = share
-      ? (hasPassword ? "已设置访问密码（留空表示不修改）" : "未设置访问密码")
-      : "可选：设置访问密码";
+      ? (hasPassword ? t("siyuanShare.hint.passwordKeep") : t("siyuanShare.label.passwordNotSet"))
+      : t("siyuanShare.hint.passwordOptional");
 
 
 
-    const content = `<div class="b3-dialog__content siyuan-plugin-share">
+    const content = `<div class="siyuan-plugin-share sps-dialog-body">
   <div class="siyuan-plugin-share__section">
     <div class="siyuan-plugin-share__title">${escapeHtml(typeLabel)}</div>
     <div>${escapeHtml(itemTitle)}</div>
-    <div class="siyuan-plugin-share__muted siyuan-plugin-share__mono">ID: ${escapeHtml(itemId)}</div>
+    <div class="siyuan-plugin-share__muted siyuan-plugin-share__mono">${escapeHtml(
+      t("siyuanShare.label.id"),
+    )}: ${escapeHtml(itemId)}</div>
   </div>
   <div class="siyuan-plugin-share__section">
-    <div class="siyuan-plugin-share__title">访问设置</div>
+    <div class="siyuan-plugin-share__title">${escapeHtml(t("siyuanShare.section.accessSettings"))}</div>
     <div class="siyuan-plugin-share__grid">
-      <div class="siyuan-plugin-share__muted">访问密码</div>
+      <div class="siyuan-plugin-share__muted">${escapeHtml(t("siyuanShare.label.accessPassword"))}</div>
       <input id="sps-share-password" type="password" class="b3-text-field" value="${escapeAttr(
         passwordInputValue,
       )}" placeholder="${escapeAttr(passwordPlaceholder)}" />
-      <div class="siyuan-plugin-share__muted">到期时间</div>
+      <div class="siyuan-plugin-share__muted">${escapeHtml(t("siyuanShare.label.expiresAt"))}</div>
       <input id="sps-share-expires" type="datetime-local" step="60" class="b3-text-field" value="${escapeAttr(
         expiresInputValue,
       )}" />
     </div>
-    <div class="siyuan-plugin-share__muted">留空表示不修改，清空并保存可移除密码/到期时间。</div>
-    <div class="siyuan-plugin-share__muted">${currentPasswordLabel} · ${currentExpiresLabel}</div>
+    <div class="siyuan-plugin-share__muted">${escapeHtml(t("siyuanShare.hint.keepOrClear"))}</div>
+    <div class="siyuan-plugin-share__muted">${escapeHtml(
+      currentPasswordLabel,
+    )} · ${escapeHtml(currentExpiresLabel)}</div>
   </div>
   <div class="siyuan-plugin-share__section">
-    <div class="siyuan-plugin-share__title">分享链接</div>
+    <div class="siyuan-plugin-share__title">${escapeHtml(t("siyuanShare.section.shareLink"))}</div>
     ${
       share
-        ? `<div class="siyuan-plugin-share__muted">分享标识：<span class="siyuan-plugin-share__mono">${escapeHtml(
-            share.slug || "",
-          )}</span></div>
+        ? `<div class="siyuan-plugin-share__muted">${escapeHtml(
+            t("siyuanShare.label.shareId"),
+          )}：<span class="siyuan-plugin-share__mono">${escapeHtml(share.slug || "")}</span></div>
       <div class="siyuan-plugin-share__actions" style="align-items: center;">
         <input class="b3-text-field fn__flex-1 siyuan-plugin-share__mono" readonly value="${escapeAttr(url)}" />
         <button class="b3-button b3-button--outline" data-action="copy" data-share-id="${escapeAttr(
           share.id,
-        )}">复制链接</button>
+        )}">${escapeHtml(t("siyuanShare.action.copyLink"))}</button>
       </div>
       <div class="siyuan-plugin-share__actions">
         <button class="b3-button b3-button--outline" data-action="update" data-share-id="${escapeAttr(
           share.id,
-        )}">更新分享</button>
+        )}">${escapeHtml(t("siyuanShare.action.updateShare"))}</button>
         <button class="b3-button b3-button--outline" data-action="delete" data-share-id="${escapeAttr(
           share.id,
-        )}">删除分享</button>
+        )}">${escapeHtml(t("siyuanShare.action.deleteShare"))}</button>
       </div>`
-        : `<div class="siyuan-plugin-share__muted">尚未创建分享。</div>
+        : `<div class="siyuan-plugin-share__muted">${escapeHtml(
+            t("siyuanShare.message.noShareYet"),
+          )}</div>
       <div class="siyuan-plugin-share__actions">
         <button class="b3-button b3-button--outline" data-action="share" data-item-id="${escapeAttr(
           itemId,
-        )}">创建分享</button>
+        )}">${escapeHtml(t("siyuanShare.action.createShare"))}</button>
       </div>`
     }
   </div>
 </div>
 <div class="b3-dialog__action">
-  <button class="b3-button b3-button--cancel" data-action="close">关闭</button>
+  <button class="b3-button b3-button--cancel" data-action="close">${escapeHtml(
+    t("siyuanShare.action.close"),
+  )}</button>
   <div class="fn__space"></div>
-  <button class="b3-button b3-button--text" data-action="open-settings">打开设置</button>
+  <button class="b3-button b3-button--text" data-action="open-settings">${escapeHtml(
+    t("siyuanShare.action.openSettings"),
+  )}</button>
 </div>`;
 
     const readShareOptions = (root) => {
@@ -1350,9 +1404,9 @@ class SiYuanSharePlugin extends Plugin {
     };
 
     const dialog = new Dialog({
-      title: "分享管理",
+      title: t("siyuanShare.title.shareManagement"),
       content,
-      width: "92vw",
+      width: "min(720px, 92vw)",
       destroyCallback: () => {
         dialog.element.removeEventListener("click", onClick);
       },
@@ -1438,37 +1492,37 @@ class SiYuanSharePlugin extends Plugin {
           return;
         }
       } catch (err) {
-        console.error(err);
-        showMessage(err.message || String(err));
+        this.showErr(err);
       }
     })();
   };
 
   onEditorTitleMenu = ({detail}) => {
     try {
+      const t = this.t.bind(this);
       const {menu, data} = detail || {};
       const docId = data?.rootID || data?.id;
       if (!isValidDocId(docId)) return;
       const share = this.getShareByDocId(docId);
       menu.addItem({
         icon: "iconSiyuanShare",
-        label: "分享管理",
+        label: t("siyuanShare.title.shareManagement"),
         click: () => void this.openShareDialogFor({type: SHARE_TYPES.DOC, id: docId}),
       });
       if (share) {
         menu.addItem({
           icon: "iconRefresh",
-          label: "更新分享",
+          label: t("siyuanShare.action.updateShare"),
           click: () => void this.updateShare(share?.id).catch(this.showErr),
         });
         menu.addItem({
           icon: "iconCopy",
-          label: "复制分享链接",
+          label: t("siyuanShare.action.copyShareLink"),
           click: () => void this.copyShareLink(share?.id).catch(this.showErr),
         });
         menu.addItem({
           icon: "iconTrashcan",
-          label: "删除分享",
+          label: t("siyuanShare.action.deleteShare"),
           click: () => void this.deleteShare(share?.id).catch(this.showErr),
         });
       }
@@ -1479,6 +1533,7 @@ class SiYuanSharePlugin extends Plugin {
 
   onDocTreeMenu = ({detail}) => {
     try {
+      const t = this.t.bind(this);
       const {menu, elements, type} = detail || {};
       const rawElements = elements ?? detail?.element;
       let elementList = [];
@@ -1594,23 +1649,23 @@ class SiYuanSharePlugin extends Plugin {
 
       menu.addItem({
         icon: "iconSiyuanShare",
-        label: share ? "管理分享" : "创建分享",
+        label: share ? t("siyuanShare.action.manageShare") : t("siyuanShare.action.createShare"),
         click: () => void this.openShareDialogFor({type: itemType, id, title}),
       });
       if (share) {
         menu.addItem({
           icon: "iconRefresh",
-          label: "更新分享",
+          label: t("siyuanShare.action.updateShare"),
           click: () => void this.updateShare(share?.id).catch(this.showErr),
         });
         menu.addItem({
           icon: "iconCopy",
-          label: "复制分享链接",
+          label: t("siyuanShare.action.copyShareLink"),
           click: () => void this.copyShareLink(share?.id).catch(this.showErr),
         });
         menu.addItem({
           icon: "iconTrashcan",
-          label: "删除分享",
+          label: t("siyuanShare.action.deleteShare"),
           click: () => void this.deleteShare(share?.id).catch(this.showErr),
         });
       }
@@ -1621,6 +1676,7 @@ class SiYuanSharePlugin extends Plugin {
 
   showErr = (err) => {
     console.error(err);
+    const t = this.t.bind(this);
     let message = err?.message || String(err);
     const lower = message.toLowerCase();
     if (
@@ -1629,25 +1685,26 @@ class SiYuanSharePlugin extends Plugin {
       lower.includes("unauthorized") ||
       lower.includes("401")
     ) {
-      message = "API Key 无效或无权限，请检查设置。";
+      message = t("siyuanShare.error.invalidApiKey");
     } else if (lower.includes("storage") || lower.includes("quota") || lower.includes("space")) {
-      message = "存储空间不足或已达上限，请清理后再试。";
+      message = t("siyuanShare.error.storageLimit");
     } else if (
       lower.includes("failed to fetch") ||
       lower.includes("network") ||
       lower.includes("connect") ||
       lower.includes("fetch")
     ) {
-      message = "网络请求失败，请检查网络或服务器地址。";
+      message = t("siyuanShare.error.networkFail");
     } else if (lower.includes("invalid metadata")) {
-      message = "分享元数据无效，请重新同步或重新分享。";
+      message = t("siyuanShare.error.invalidMetadata");
     } else if (lower.includes("missing docid")) {
-      message = "未找到文档 ID，请重新打开文档再试。";
+      message = t("siyuanShare.error.missingDocId");
     }
-    showMessage(message);
+    this.notify(message);
   };
 
   openProgressDialog(message, controller) {
+    const t = this.t.bind(this);
     try {
       if (this.progressDialog) {
         this.progressDialog.destroy();
@@ -1655,15 +1712,18 @@ class SiYuanSharePlugin extends Plugin {
     } catch {
       // ignore
     }
-    const safeMessage = escapeHtml(message || "处理中...");
+    const safeMessage = escapeHtml(message || t("siyuanShare.message.processing"));
     const dialog = new Dialog({
-      title: "处理中",
+      title: t("siyuanShare.title.processing"),
       content: `<div class="sps-progress">
   <div class="sps-progress__title">${safeMessage}</div>
   <div class="sps-progress__bar"><div class="sps-progress__bar-inner"></div></div>
-  <div class="sps-progress__actions">
-    <button class="b3-button b3-button--outline" data-action="cancel">取消</button>
-  </div>
+</div>
+<div class="b3-dialog__action">
+  <div class="fn__space"></div>
+  <button class="b3-button b3-button--outline" data-action="cancel">${t(
+    "siyuanShare.action.cancel",
+  )}</button>
 </div>`,
       width: "360px",
     });
@@ -1714,6 +1774,7 @@ class SiYuanSharePlugin extends Plugin {
   }
 
   initSettingPanel() {
+    const t = this.t.bind(this);
     const siteInput = document.createElement("input");
     siteInput.className = "b3-text-field fn__block";
     siteInput.placeholder = "https://example.com";
@@ -1721,7 +1782,7 @@ class SiYuanSharePlugin extends Plugin {
     const apiKeyInput = document.createElement("input");
     apiKeyInput.className = "b3-text-field fn__block";
     apiKeyInput.type = "password";
-    apiKeyInput.placeholder = "API Key";
+    apiKeyInput.placeholder = t("siyuanShare.label.apiKey");
 
     const currentWrap = document.createElement("div");
     currentWrap.className = "siyuan-plugin-share";
@@ -1748,47 +1809,51 @@ class SiYuanSharePlugin extends Plugin {
     });
 
     this.setting.addItem({
-      title: "站点地址",
-      description: "请输入服务端地址，例如 https://example.com",
+      title: t("siyuanShare.label.siteUrl"),
+      description: t("siyuanShare.hint.siteUrl"),
       createActionElement: () => siteInput,
     });
     this.setting.addItem({
-      title: "API Key",
-      description: "在后台生成并填写 API Key，用于鉴权",
+      title: t("siyuanShare.label.apiKey"),
+      description: t("siyuanShare.hint.apiKey"),
       createActionElement: () => apiKeyInput,
     });
 
     const connectActions = document.createElement("div");
     connectActions.className = "siyuan-plugin-share__actions";
     connectActions.innerHTML = `
-  <button class="b3-button b3-button--outline" data-action="settings-sync">验证并同步</button>
-  <button class="b3-button b3-button--outline" data-action="settings-disconnect">断开连接</button>
+  <button class="b3-button b3-button--outline" data-action="settings-sync">${t(
+    "siyuanShare.action.verifySync",
+  )}</button>
+  <button class="b3-button b3-button--outline" data-action="settings-disconnect">${t(
+    "siyuanShare.action.disconnect",
+  )}</button>
 `;
     connectActions.addEventListener("click", this.onSettingActionsClick);
     this.setting.addItem({
-      title: "连接与同步",
-      description: "用于校验站点连接并同步配置。",
+      title: t("siyuanShare.label.connectionSync"),
+      description: t("siyuanShare.hint.connectionSync"),
       direction: "column",
       createActionElement: () => connectActions,
     });
 
     this.setting.addItem({
-      title: "环境信息",
+      title: t("siyuanShare.label.envInfo"),
       description: "",
       direction: "column",
       createActionElement: () => envHint,
     });
 
     this.setting.addItem({
-      title: "当前分享信息",
-      description: "展示当前文档/笔记本的分享状态与设置。",
+      title: t("siyuanShare.label.currentShareInfo"),
+      description: t("siyuanShare.hint.currentShare"),
       direction: "column",
       createActionElement: () => currentWrap,
     });
 
     this.setting.addItem({
-      title: "分享列表",
-      description: "查看、复制、更新或删除分享。",
+      title: t("siyuanShare.label.shareList"),
+      description: t("siyuanShare.hint.shareList"),
       direction: "column",
       createActionElement: () => sharesWrap,
     });
@@ -1804,23 +1869,29 @@ class SiYuanSharePlugin extends Plugin {
     if (siteInput) siteInput.value = this.settings.siteUrl || "";
     if (apiKeyInput) apiKeyInput.value = this.settings.apiKey || "";
     if (envHint) {
+      const t = this.t.bind(this);
       const base = normalizeUrlBase(this.settings.siteUrl);
       const hasKey = !!(this.settings.apiKey || "").trim();
       if (!base || !hasKey) {
-        envHint.innerHTML = "请先填写站点地址和 API Key。";
+        envHint.textContent = t("siyuanShare.hint.needSiteAndKey");
         return;
       }
       const userLabel = this.remoteUser?.username
-        ? `已连接用户：${escapeHtml(this.remoteUser.username)}`
-        : "未获取到用户信息";
+        ? t("siyuanShare.hint.statusConnectedUser", {
+            user: escapeHtml(this.remoteUser.username),
+          })
+        : t("siyuanShare.hint.statusConnectedNoUser");
       const timeLabel = this.remoteVerifiedAt
-        ? `上次验证时间：${escapeHtml(this.formatTime(this.remoteVerifiedAt))}`
+        ? t("siyuanShare.hint.lastVerifiedAt", {
+            time: escapeHtml(this.formatTime(this.remoteVerifiedAt)),
+          })
         : "";
-      envHint.innerHTML = `${userLabel}${timeLabel}`;
+      envHint.innerHTML = timeLabel ? `${userLabel} · ${timeLabel}` : userLabel;
     }
   }
 
   saveSettingsFromSetting = async ({notify = true} = {}) => {
+    const t = this.t.bind(this);
     const {siteInput, apiKeyInput} = this.settingEls;
     const next = {
       siteUrl: (siteInput?.value || "").trim(),
@@ -1837,7 +1908,7 @@ class SiYuanSharePlugin extends Plugin {
     this.renderDock();
     this.renderSettingShares();
     this.syncSettingInputs();
-    if (notify) showMessage("已断开连接");
+    if (notify) this.notify(t("siyuanShare.message.disconnected"));
   };
 
   onSettingActionsClick = (event) => {
@@ -1871,11 +1942,12 @@ class SiYuanSharePlugin extends Plugin {
 
     void (async () => {
       try {
+        const t = this.t.bind(this);
         const docId = this.currentDoc.id;
-        if (!isValidDocId(docId)) throw new Error("未检测到当前文档，请先打开文档。");
+        if (!isValidDocId(docId)) throw new Error(t("siyuanShare.message.noCurrentDoc"));
 
         const share = this.getShareByDocId(docId);
-        if (!share) throw new Error("当前文档尚未分享。");
+        if (!share) throw new Error(t("siyuanShare.message.currentDocNoShare"));
         if (action === "copy-link") return await this.copyShareLink(share.id);
         if (action === "update") return await this.updateShare(share.id);
         if (action === "delete") return await this.deleteShare(share.id);
@@ -1906,38 +1978,57 @@ class SiYuanSharePlugin extends Plugin {
     const wrap = this.settingEls?.currentWrap;
     if (!wrap) return;
 
+    const t = this.t.bind(this);
     const docId = this.currentDoc.id;
     if (!isValidDocId(docId)) {
       wrap.innerHTML = `<div class="siyuan-plugin-share__section">
-  <div class="siyuan-plugin-share__muted">未检测到当前文档，请先打开文档。</div>
+  <div class="siyuan-plugin-share__muted">${escapeHtml(t("siyuanShare.message.noCurrentDoc"))}</div>
 </div>`;
       return;
     }
 
-    const title = this.currentDoc.title || "(未命名文档)";
+    const title = this.currentDoc.title || t("siyuanShare.label.untitledDoc");
     const share = this.getShareByDocId(docId);
     const url = share ? this.getShareUrl(share) : "";
-    const passwordLabel = share?.hasPassword ? "已设置访问密码" : "未设置访问密码";
-    const expiresLabel = share?.expiresAt ? this.formatTime(share.expiresAt) : "未设置到期时间";
+    const passwordLabel = share?.hasPassword
+      ? t("siyuanShare.label.passwordSet")
+      : t("siyuanShare.label.passwordNotSet");
+    const expiresLabel = share?.expiresAt ? this.formatTime(share.expiresAt) : t("siyuanShare.label.expiresNotSet");
     wrap.innerHTML = `<div class="siyuan-plugin-share__section">
-  <div class="siyuan-plugin-share__title">${share ? "已分享文档" : "未分享文档"}</div>
+  <div class="siyuan-plugin-share__title">${escapeHtml(
+    share ? t("siyuanShare.label.sharedDoc") : t("siyuanShare.label.unsharedDoc"),
+  )}</div>
   <div>${escapeHtml(title)}</div>
-  <div class="siyuan-plugin-share__muted siyuan-plugin-share__mono">ID: ${escapeHtml(docId)}</div>
+  <div class="siyuan-plugin-share__muted siyuan-plugin-share__mono">${escapeHtml(
+    t("siyuanShare.label.id"),
+  )}: ${escapeHtml(docId)}</div>
   ${
     share
-      ? `<div class="siyuan-plugin-share__muted">分享标识：<span class="siyuan-plugin-share__mono">${escapeHtml(
+      ? `<div class="siyuan-plugin-share__muted">${escapeHtml(
+          t("siyuanShare.label.shareId"),
+        )}：<span class="siyuan-plugin-share__mono">${escapeHtml(
           share.slug || "",
-        )}</span> · 更新时间：${escapeHtml(this.formatTime(share.updatedAt))}</div>
+        )}</span> · ${escapeHtml(t("siyuanShare.label.updatedAt"))}：${escapeHtml(
+          this.formatTime(share.updatedAt),
+        )}</div>
   <div class="siyuan-plugin-share__muted">${escapeHtml(passwordLabel)} · ${escapeHtml(expiresLabel)}</div>
   <div class="siyuan-plugin-share__actions" style="align-items: center;">
     <input class="b3-text-field fn__flex-1 siyuan-plugin-share__mono" readonly value="${escapeAttr(url)}" />
-    <button class="b3-button b3-button--outline" data-action="copy-link">复制链接</button>
+    <button class="b3-button b3-button--outline" data-action="copy-link">${escapeHtml(
+      t("siyuanShare.action.copyLink"),
+    )}</button>
   </div>
   <div class="siyuan-plugin-share__actions">
-    <button class="b3-button b3-button--outline" data-action="update">更新分享</button>
-    <button class="b3-button b3-button--outline" data-action="delete">删除分享</button>
+    <button class="b3-button b3-button--outline" data-action="update">${escapeHtml(
+      t("siyuanShare.action.updateShare"),
+    )}</button>
+    <button class="b3-button b3-button--outline" data-action="delete">${escapeHtml(
+      t("siyuanShare.action.deleteShare"),
+    )}</button>
   </div>`
-      : `<div class="siyuan-plugin-share__muted">当前文档尚未创建分享。</div>`
+      : `<div class="siyuan-plugin-share__muted">${escapeHtml(
+          t("siyuanShare.message.currentDocNoShare"),
+        )}</div>`
   }
 </div>`;
   }
@@ -1945,29 +2036,41 @@ class SiYuanSharePlugin extends Plugin {
   renderSettingShares() {
     const wrap = this.settingEls?.sharesWrap;
     if (!wrap) return;
+    const t = this.t.bind(this);
     const items = this.shares
       .map((s) => {
         const url = this.getShareUrl(s);
         const isCurrent = s.type === SHARE_TYPES.DOC && s.docId === this.currentDoc.id;
-        const typeLabel = s.type === SHARE_TYPES.NOTEBOOK ? "笔记本" : "文档";
+        const typeLabel =
+          s.type === SHARE_TYPES.NOTEBOOK ? t("siyuanShare.label.notebook") : t("siyuanShare.label.document");
         const idLabel = s.type === SHARE_TYPES.NOTEBOOK ? s.notebookId : s.docId;
-        const passwordLabel = s.hasPassword ? "有密码" : "无密码";
-        const expiresLabel = s.expiresAt ? this.formatTime(s.expiresAt) : "未设置到期时间";
+        const passwordLabel = s.hasPassword ? t("siyuanShare.label.passwordYes") : t("siyuanShare.label.passwordNo");
+        const expiresLabel = s.expiresAt ? this.formatTime(s.expiresAt) : t("siyuanShare.label.expiresNotSet");
         return `<div class="sps-share-item ${isCurrent ? "sps-share-item--current" : ""}">
   <div class="sps-share-item__main">
     <div class="sps-share-item__title" title="${escapeAttr(s.title || "")}">${escapeHtml(
-          s.title || "(未命名)",
+          s.title || t("siyuanShare.label.untitled"),
         )}</div>
     <div class="sps-share-item__meta">
-      <span class="siyuan-plugin-share__mono" title="分享标识">${escapeHtml(s.slug || "")}</span>
-      <span class="siyuan-plugin-share__muted" title="类型">${escapeHtml(typeLabel)}</span>
-      <span class="siyuan-plugin-share__muted" title="更新时间">${escapeHtml(
+      <span class="siyuan-plugin-share__mono" title="${escapeAttr(
+          t("siyuanShare.label.shareId"),
+        )}">${escapeHtml(s.slug || "")}</span>
+      <span class="siyuan-plugin-share__muted" title="${escapeAttr(
+          t("siyuanShare.label.type"),
+        )}">${escapeHtml(typeLabel)}</span>
+      <span class="siyuan-plugin-share__muted" title="${escapeAttr(
+          t("siyuanShare.label.updatedAt"),
+        )}">${escapeHtml(
           this.formatTime(s.updatedAt),
         )}</span>
-      <span class="siyuan-plugin-share__muted" title="访问设置">${escapeHtml(
+      <span class="siyuan-plugin-share__muted" title="${escapeAttr(
+          t("siyuanShare.label.accessSettings"),
+        )}">${escapeHtml(
           passwordLabel,
         )} · ${escapeHtml(expiresLabel)}</span>
-      <span class="siyuan-plugin-share__muted siyuan-plugin-share__mono" title="ID">${escapeHtml(
+      <span class="siyuan-plugin-share__muted siyuan-plugin-share__mono" title="${escapeAttr(
+          t("siyuanShare.label.id"),
+        )}">${escapeHtml(
           idLabel || "",
         )}</span>
     </div>
@@ -1975,25 +2078,27 @@ class SiYuanSharePlugin extends Plugin {
       <input class="b3-text-field fn__flex-1 siyuan-plugin-share__mono" readonly value="${escapeAttr(url)}" />
       <button class="b3-button b3-button--outline" data-action="copy-link" data-share-id="${escapeAttr(
           s.id,
-        )}">复制链接</button>
+        )}">${escapeHtml(t("siyuanShare.action.copyLink"))}</button>
     </div>
   </div>
   <div class="sps-share-item__actions">
     <button class="b3-button b3-button--outline" data-action="update" data-share-id="${escapeAttr(
           s.id,
-        )}">更新分享</button>
+        )}">${escapeHtml(t("siyuanShare.action.updateShare"))}</button>
     <button class="b3-button b3-button--outline" data-action="delete" data-share-id="${escapeAttr(
           s.id,
-        )}">删除分享</button>
+        )}">${escapeHtml(t("siyuanShare.action.deleteShare"))}</button>
   </div>
 </div>`;
       })
       .join("");
 
     wrap.innerHTML = `<div class="siyuan-plugin-share__section">
-  <div class="siyuan-plugin-share__title">分享列表 (${this.shares.length})</div>
+  <div class="siyuan-plugin-share__title">${escapeHtml(
+    t("siyuanShare.title.shareListCount", {count: this.shares.length}),
+  )}</div>
   <div class="sps-share-list">
-    ${items || `<div class="siyuan-plugin-share__muted">暂无分享记录。</div>`}
+    ${items || `<div class="siyuan-plugin-share__muted">${escapeHtml(t("siyuanShare.message.noShareRecords"))}</div>`}
   </div>
 </div>`;
   }
@@ -2031,7 +2136,7 @@ class SiYuanSharePlugin extends Plugin {
       setTimeout(() => this.applySettingWideLayout(), 80);
     } catch (err) {
       console.error(err);
-      showMessage("打开分享面板失败，请检查日志。");
+      this.notify(this.t("siyuanShare.message.openSharePanelFailed"));
     }
   }
 
@@ -2047,27 +2152,28 @@ class SiYuanSharePlugin extends Plugin {
       allowRequestError = true,
     } = {},
   ) {
-    if (!isValidDocId(docId)) throw new Error("无效的文档 ID");
+    const t = this.t.bind(this);
+    if (!isValidDocId(docId)) throw new Error(t("siyuanShare.error.invalidDocId"));
     const controller = new AbortController();
-    const progress = this.openProgressDialog("正在创建分享...", controller);
+    const progress = this.openProgressDialog(t("siyuanShare.progress.creatingShare"), controller);
     try {
-      progress.update("正在验证站点连接...");
+      progress.update(t("siyuanShare.progress.verifyingSite"));
       await this.verifyRemote({controller, progress});
-      throwIfAborted(controller);
-      progress.update("正在获取文档信息...");
+      throwIfAborted(controller, t("siyuanShare.message.cancelled"));
+      progress.update(t("siyuanShare.progress.fetchingDocInfo"));
       const info = await this.resolveDocInfoFromAnyId(docId);
-      const title = info?.title || "(未命名)";
-      throwIfAborted(controller);
-      progress.update("正在导出 Markdown...");
+      const title = info?.title || t("siyuanShare.label.untitled");
+      throwIfAborted(controller, t("siyuanShare.message.cancelled"));
+      progress.update(t("siyuanShare.progress.exportingMarkdown"));
       const exportRes = await this.exportDocMarkdown(docId);
-      throwIfAborted(controller);
-      progress.update("正在准备资源文件...");
+      throwIfAborted(controller, t("siyuanShare.message.cancelled"));
+      progress.update(t("siyuanShare.progress.preparingAssets"));
       const {markdown, assets, failures} = await this.prepareMarkdownAssets(
         exportRes.content || "",
         controller,
       );
       if (failures.length > 0) {
-        showMessage(`有 ${failures.length} 个资源获取失败，已跳过。`);
+        this.notify(t("siyuanShare.message.resourcesSkipped", {count: failures.length}));
       }
       const payload = {
         docId,
@@ -2094,21 +2200,21 @@ class SiYuanSharePlugin extends Plugin {
         form.append("assets[]", asset.blob, asset.path);
         form.append("assetPaths[]", asset.path);
       }
-      progress.update("正在上传分享内容...");
+      progress.update(t("siyuanShare.progress.uploadingContent"));
       let requestError = null;
       try {
         await this.remoteRequest(REMOTE_API.shareDoc, {
           method: "POST",
           body: form,
           isForm: true,
-          progressText: "正在上传分享内容...",
+          progressText: t("siyuanShare.progress.uploadingContent"),
           controller,
           progress,
         });
       } catch (err) {
         requestError = err;
       }
-      progress.update("正在同步分享列表...");
+      progress.update(t("siyuanShare.progress.syncingShareList"));
       let syncError = null;
       try {
         await this.syncRemoteShares({silent: true, controller, progress});
@@ -2120,14 +2226,14 @@ class SiYuanSharePlugin extends Plugin {
       if (!share) {
         if (requestError) throw requestError;
         if (syncError) throw syncError;
-        throw new Error("分享创建失败，请重试。");
+        throw new Error(t("siyuanShare.error.shareCreateFailed"));
       }
       if (requestError) {
         console.warn("shareDoc response error, but share exists after sync", requestError);
       }
       const url = this.getShareUrl(share);
       this.renderSettingCurrent();
-      showMessage(`分享已创建：${url || title}`);
+      this.notify(t("siyuanShare.message.shareCreated", {value: url || title}));
       if (url) await this.tryCopyToClipboard(url);
     } finally {
       progress?.close();
@@ -2145,32 +2251,37 @@ class SiYuanSharePlugin extends Plugin {
       allowRequestError = true,
     } = {},
   ) {
-    if (!isValidNotebookId(notebookId)) throw new Error("无效的笔记本 ID");
+    const t = this.t.bind(this);
+    if (!isValidNotebookId(notebookId)) throw new Error(t("siyuanShare.error.invalidNotebookId"));
     const controller = new AbortController();
-    const progress = this.openProgressDialog("正在创建笔记本分享...", controller);
+    const progress = this.openProgressDialog(t("siyuanShare.progress.creatingNotebookShare"), controller);
     try {
-      progress.update("正在验证站点连接...");
+      progress.update(t("siyuanShare.progress.verifyingSite"));
       await this.verifyRemote({controller, progress});
-      throwIfAborted(controller);
+      throwIfAborted(controller, t("siyuanShare.message.cancelled"));
       if (!this.notebooks.length) {
-        progress.update("正在获取笔记本与文档列表...");
+        progress.update(t("siyuanShare.progress.fetchingNotebookList"));
         await this.refreshNotebookOptions({silent: true});
       }
       const notebook = this.notebooks.find((n) => n.id === notebookId);
       const tree = await this.listDocsInNotebook(notebookId);
       const docs = Array.isArray(tree?.docs) ? tree.docs : Array.isArray(tree) ? tree : [];
       const title = notebook?.name || tree?.title || notebookId;
-      progress.update("正在准备笔记本内容...");
-      if (!docs.length) throw new Error("未找到可分享的文档。");
+      progress.update(t("siyuanShare.progress.preparingNotebook"));
+      if (!docs.length) throw new Error(t("siyuanShare.error.noDocsToShare"));
       const docPayloads = [];
       const assetMap = new Map();
       let failureCount = 0;
       for (const [index, doc] of docs.entries()) {
-        throwIfAborted(controller);
-        progress.update(`正在导出文档 (${index + 1}/${docs.length})...`);
+        throwIfAborted(controller, t("siyuanShare.message.cancelled"));
+        progress.update(
+          t("siyuanShare.progress.exportingDoc", {index: index + 1, total: docs.length}),
+        );
         const exportRes = await this.exportDocMarkdown(doc.docId);
-        throwIfAborted(controller);
-        progress.update(`正在准备资源文件 (${index + 1}/${docs.length})...`);
+        throwIfAborted(controller, t("siyuanShare.message.cancelled"));
+        progress.update(
+          t("siyuanShare.progress.preparingAssetsIndex", {index: index + 1, total: docs.length}),
+        );
         const {markdown, assets, failures} = await this.prepareMarkdownAssets(
           exportRes.content || "",
           controller,
@@ -2178,7 +2289,7 @@ class SiYuanSharePlugin extends Plugin {
         failureCount += failures.length;
         docPayloads.push({
           docId: doc.docId,
-          title: doc.title || "(未命名)",
+          title: doc.title || t("siyuanShare.label.untitled"),
           hPath: exportRes.hPath || "",
           markdown,
           parentId: doc.parentId || "",
@@ -2192,7 +2303,7 @@ class SiYuanSharePlugin extends Plugin {
         }
       }
       if (failureCount > 0) {
-        showMessage(`有 ${failureCount} 个文档导出失败，已跳过。`);
+        this.notify(t("siyuanShare.message.docsExportSkipped", {count: failureCount}));
       }
       const payload = {
         notebookId,
@@ -2218,21 +2329,21 @@ class SiYuanSharePlugin extends Plugin {
         form.append("assetPaths[]", asset.path);
         form.append("assetDocIds[]", docId);
       }
-      progress.update("正在上传分享内容...");
+      progress.update(t("siyuanShare.progress.uploadingContent"));
       let requestError = null;
       try {
         await this.remoteRequest(REMOTE_API.shareNotebook, {
           method: "POST",
           body: form,
           isForm: true,
-          progressText: "正在上传分享内容...",
+          progressText: t("siyuanShare.progress.uploadingContent"),
           controller,
           progress,
         });
       } catch (err) {
         requestError = err;
       }
-      progress.update("正在同步分享列表...");
+      progress.update(t("siyuanShare.progress.syncingShareList"));
       let syncError = null;
       try {
         await this.syncRemoteShares({silent: true, controller, progress});
@@ -2244,13 +2355,13 @@ class SiYuanSharePlugin extends Plugin {
       if (!share) {
         if (requestError) throw requestError;
         if (syncError) throw syncError;
-        throw new Error("分享创建失败，请重试。");
+        throw new Error(t("siyuanShare.error.shareCreateFailed"));
       }
       if (requestError) {
         console.warn("shareNotebook response error, but share exists after sync", requestError);
       }
       const url = this.getShareUrl(share);
-      showMessage(`分享已创建：${url || title}`);
+      this.notify(t("siyuanShare.message.shareCreated", {value: url || title}));
       if (url) await this.tryCopyToClipboard(url);
     } finally {
       progress?.close();
@@ -2259,6 +2370,7 @@ class SiYuanSharePlugin extends Plugin {
 
   async listDocsInNotebook(notebookId) {
     if (!isValidNotebookId(notebookId)) return {docs: [], title: ""};
+    const t = this.t.bind(this);
     try {
       const treeResp = await fetchSyncPost("/api/filetree/getDocTree", {id: notebookId});
       if (treeResp && treeResp.code === 0) {
@@ -2274,7 +2386,7 @@ class SiYuanSharePlugin extends Plugin {
             title: String(treeTitle || "").trim(),
             docs: flat.map((doc, index) => ({
               docId: String(doc.docId || "").trim(),
-              title: doc.title || "(未命名)",
+              title: doc.title || t("siyuanShare.label.untitled"),
               parentId: String(doc.parentId || "").trim(),
               sortIndex: Number.isFinite(doc.sortIndex) ? doc.sortIndex : index,
               sortOrder: index,
@@ -2283,7 +2395,7 @@ class SiYuanSharePlugin extends Plugin {
         }
       }
     } catch (err) {
-      console.warn("文档树接口失败", err);
+      console.warn("Doc tree API failed", err);
     }
 
     try {
@@ -2351,7 +2463,7 @@ class SiYuanSharePlugin extends Plugin {
         }
       }
     } catch (err) {
-      console.warn("SQL 查询失败", err);
+      console.warn("SQL query failed", err);
     }
 
     return {docs: [], title: ""};
@@ -2361,9 +2473,10 @@ class SiYuanSharePlugin extends Plugin {
     shareId,
     {password = "", clearPassword = false, expiresAt = null, clearExpires = false} = {},
   ) {
-        if (!shareId) throw new Error("缺少分享 ID");
+    const t = this.t.bind(this);
+    if (!shareId) throw new Error(t("siyuanShare.error.missingShareId"));
     const existing = this.getShareById(shareId);
-    if (!existing) throw new Error("分享不存在");
+    if (!existing) throw new Error(t("siyuanShare.error.shareNotFound"));
     if (existing.type === SHARE_TYPES.NOTEBOOK) {
       await this.shareNotebook(existing.notebookId, {
         slugOverride: existing.slug,
@@ -2386,14 +2499,17 @@ class SiYuanSharePlugin extends Plugin {
   }
 
   async deleteShare(shareId) {
-    if (!shareId) throw new Error("缺少分享 ID");
+    const t = this.t.bind(this);
+    if (!shareId) throw new Error(t("siyuanShare.error.missingShareId"));
     const existing = this.getShareById(shareId);
-    if (!existing) throw new Error("分享不存在");
+    if (!existing) throw new Error(t("siyuanShare.error.shareNotFound"));
 
     await new Promise((resolve) => {
       confirm(
-        "确认删除分享？",
-        `将删除分享“${existing.title || existing.slug || existing.id}”，此操作不可恢复。`,
+        t("siyuanShare.confirm.deleteShareTitle"),
+        t("siyuanShare.confirm.deleteShareMessage", {
+          name: existing.title || existing.slug || existing.id,
+        }),
         () => resolve(true),
         () => resolve(false),
       );
@@ -2403,22 +2519,23 @@ class SiYuanSharePlugin extends Plugin {
       await this.remoteRequest(REMOTE_API.deleteShare, {
         method: "POST",
         body: {shareId: existing.id, hardDelete: true},
-        progressText: "正在删除分享...",
+        progressText: t("siyuanShare.progress.deletingShare"),
       });
       await this.syncRemoteShares({silent: true});
       this.renderSettingCurrent();
-      showMessage("删除成功");
+      this.notify(t("siyuanShare.message.deleteSuccess"));
     });
   }
 
   async copyShareLink(shareId) {
+    const t = this.t.bind(this);
     const existing = this.getShareById(shareId);
-    if (!existing) throw new Error("分享不存在");
+    if (!existing) throw new Error(t("siyuanShare.error.shareNotFound"));
     await this.verifyRemote();
     const url = this.getShareUrl(existing);
-    if (!url) throw new Error("分享链接为空");
+    if (!url) throw new Error(t("siyuanShare.error.shareLinkEmpty"));
     await this.tryCopyToClipboard(url);
-    showMessage("已复制链接");
+    this.notify(t("siyuanShare.message.copyLinkSuccess"));
   }
 
   async tryCopyToClipboard(text) {
@@ -2448,10 +2565,11 @@ class SiYuanSharePlugin extends Plugin {
     path,
     {method = "POST", body, isForm = false, progressText = "", controller = null, progress = null} = {},
   ) {
+    const t = this.t.bind(this);
     const base = normalizeUrlBase(this.settings.siteUrl);
-    if (!base) throw new Error("请先设置站点地址");
+    if (!base) throw new Error(t("siyuanShare.error.siteUrlRequired"));
     const headers = {...this.getRemoteHeaders()};
-    if (!headers["X-Api-Key"]) throw new Error("请先设置 API Key");
+    if (!headers["X-Api-Key"]) throw new Error(t("siyuanShare.error.apiKeyRequired"));
     if (!isForm && method !== "GET") {
       headers["Content-Type"] = "application/json";
     }
@@ -2466,7 +2584,7 @@ class SiYuanSharePlugin extends Plugin {
     options.signal = requestController.signal;
     const ownsProgress = !progress;
     const handle =
-      progress || this.openProgressDialog(progressText || "请求处理中...", requestController);
+      progress || this.openProgressDialog(progressText || t("siyuanShare.progress.requesting"), requestController);
     if (progressText && handle?.update) {
       handle.update(progressText);
     }
@@ -2474,12 +2592,12 @@ class SiYuanSharePlugin extends Plugin {
       const resp = await fetch(`${base}${path}`, options);
       const json = await resp.json().catch(() => null);
       if (!resp.ok || !json || json.code !== 0) {
-        throw new Error(json?.msg || `远程请求失败 (${resp.status})`);
+        throw new Error(json?.msg || t("siyuanShare.error.remoteRequestFailed", {status: resp.status}));
       }
       return json.data;
     } catch (err) {
       if (err?.name === "AbortError") {
-        throw new Error("已取消操作");
+        throw new Error(t("siyuanShare.message.cancelled"));
       }
       throw err;
     } finally {
@@ -2490,8 +2608,9 @@ class SiYuanSharePlugin extends Plugin {
   }
 
   async verifyRemote({silent = false, controller = null, progress = null} = {}) {
+    const t = this.t.bind(this);
     if (!this.settings.siteUrl || !this.settings.apiKey) {
-      if (!silent) throw new Error("请先设置站点地址和 API Key");
+      if (!silent) throw new Error(t("siyuanShare.error.siteAndKeyRequired"));
       return null;
     }
     if (this.remoteUser && this.remoteVerifiedAt && nowTs() - this.remoteVerifiedAt < 60000) {
@@ -2500,7 +2619,7 @@ class SiYuanSharePlugin extends Plugin {
     const data = await this.remoteRequest(REMOTE_API.verify, {
       method: "POST",
       body: {},
-      progressText: "正在验证站点连接...",
+      progressText: t("siyuanShare.progress.verifyingSite"),
       controller,
       progress,
     });
@@ -2511,9 +2630,10 @@ class SiYuanSharePlugin extends Plugin {
   }
 
   async syncRemoteShares({silent = false, controller = null, progress = null} = {}) {
+    const t = this.t.bind(this);
     const data = await this.remoteRequest(REMOTE_API.shares, {
       method: "GET",
-      progressText: "正在同步分享列表...",
+      progressText: t("siyuanShare.progress.syncingShareList"),
       controller,
       progress,
     });
@@ -2525,7 +2645,7 @@ class SiYuanSharePlugin extends Plugin {
     this.renderSettingShares();
     this.refreshDocTreeMarks();
     this.updateTopBarState();
-    if (!silent) showMessage("验证成功");
+    if (!silent) this.notify(t("siyuanShare.message.verifySuccess"));
     return shares;
   }
 
@@ -2540,6 +2660,7 @@ class SiYuanSharePlugin extends Plugin {
   }
 
   async disconnectRemote() {
+    const t = this.t.bind(this);
     this.settings = {siteUrl: "", apiKey: ""};
     this.remoteUser = null;
     this.remoteVerifiedAt = 0;
@@ -2550,19 +2671,20 @@ class SiYuanSharePlugin extends Plugin {
     this.renderDock();
     this.renderSettingShares();
     this.updateTopBarState();
-    showMessage("已断开连接。");
+    this.notify(t("siyuanShare.message.disconnected"));
   }
 
   async fetchNotebooks() {
     const resp = await fetchSyncPost("/api/notebook/lsNotebooks", {});
-    if (!resp || resp.code !== 0) throw new Error(resp?.msg || "获取笔记本列表失败。");
+    if (!resp || resp.code !== 0) throw new Error(resp?.msg || this.t("siyuanShare.error.notebookListFailed"));
     return resp?.data?.notebooks || [];
   }
 
   async refreshNotebookOptions({silent = false} = {}) {
+    const t = this.t.bind(this);
     try {
       this.notebooks = await this.fetchNotebooks();
-      if (!silent) showMessage("笔记本列表已刷新。");
+      if (!silent) this.notify(t("siyuanShare.message.notebookListRefreshed"));
     } catch (err) {
       if (!silent) this.showErr(err);
     }
@@ -2570,7 +2692,7 @@ class SiYuanSharePlugin extends Plugin {
 
   async exportDocMarkdown(docId) {
     const resp = await fetchSyncPost("/api/export/exportMdContent", {id: docId});
-    if (!resp || resp.code !== 0) throw new Error(resp?.msg || "?? Markdown ???");
+    if (!resp || resp.code !== 0) throw new Error(resp?.msg || this.t("siyuanShare.error.exportMarkdownFailed"));
     return {
       hPath: resp?.data?.hPath || "",
       content: resp?.data?.content || "",
@@ -2578,8 +2700,9 @@ class SiYuanSharePlugin extends Plugin {
   }
 
   async fetchAssetBlob(assetPath, controller) {
+    const t = this.t.bind(this);
     const normalized = normalizeAssetPath(assetPath);
-    if (!normalized) throw new Error("资源路径无效。");
+    if (!normalized) throw new Error(t("siyuanShare.error.resourcePathInvalid"));
     let workspacePath = normalized;
     if (!workspacePath.startsWith("data/")) {
       if (workspacePath.startsWith("assets/")) {
@@ -2601,53 +2724,59 @@ class SiYuanSharePlugin extends Plugin {
       });
     } catch (err) {
       if (err?.name === "AbortError") {
-        throw new Error("资源下载已取消。");
+        throw new Error(t("siyuanShare.error.resourceDownloadCanceled"));
       }
       throw err;
     }
     if (!resp.ok) {
       const err = await resp.json().catch(() => null);
-      throw new Error(err?.msg || `获取资源失败 (${resp.status})`);
+      throw new Error(err?.msg || t("siyuanShare.error.resourceDownloadFailed", {status: resp.status}));
     }
     const blob = await resp.blob();
     return {path: normalized, blob};
   }
 
   async prepareMarkdownAssets(markdown, controller) {
+    const t = this.t.bind(this);
+    const cancelledMsg = t("siyuanShare.error.resourceDownloadCanceled");
     const fixed = rewriteAssetLinks(markdown || "");
     const assetPaths = extractAssetPaths(fixed);
     const assets = [];
     const failures = [];
     for (const path of assetPaths) {
       try {
-        throwIfAborted(controller);
+        throwIfAborted(controller, t("siyuanShare.message.cancelled"));
         assets.push(await this.fetchAssetBlob(path, controller));
       } catch (err) {
-        if (err?.message === "资源下载已取消。") {
+        if (err?.message === cancelledMsg) {
           throw err;
         }
         failures.push({path, err});
       }
     }
     if (failures.length > 0) {
-      console.warn("部分资源下载失败。", failures);
+      console.warn("Some assets failed to download.", failures);
     }
     return {markdown: fixed, assets, failures};
   }
 
   renderDock() {
     if (!this.dockElement) return;
+    const t = this.t.bind(this);
     const siteUrl = this.settings.siteUrl || "";
     const apiKey = this.settings.apiKey || "";
     const statusLabel = !siteUrl || !apiKey
-      ? "请先填写站点地址和 API Key。"
+      ? t("siyuanShare.hint.needSiteAndKey")
       : this.remoteUser?.username
-        ? `已连接：${escapeHtml(this.remoteUser.username)}`
-        : "已连接，未获取到用户信息。";
+        ? t("siyuanShare.hint.statusConnectedUser", {
+            user: escapeHtml(this.remoteUser.username),
+          })
+        : t("siyuanShare.hint.statusConnectedNoUser");
     const rows = this.shares
       .map((s) => {
         const url = this.getShareUrl(s);
-        const typeLabel = s.type === SHARE_TYPES.NOTEBOOK ? "笔记本" : "文档";
+        const typeLabel =
+          s.type === SHARE_TYPES.NOTEBOOK ? t("siyuanShare.label.notebook") : t("siyuanShare.label.document");
         const idLabel = s.type === SHARE_TYPES.NOTEBOOK ? s.notebookId : s.docId;
         return `<tr>
   <td>
@@ -2663,13 +2792,13 @@ class SiYuanSharePlugin extends Plugin {
     <div class="siyuan-plugin-share__actions">
       <button class="b3-button b3-button--outline" data-action="copy-link" data-share-id="${escapeAttr(
           s.id,
-        )}">复制链接</button>
+        )}">${escapeHtml(t("siyuanShare.action.copyLink"))}</button>
       <button class="b3-button b3-button--outline" data-action="update" data-share-id="${escapeAttr(
           s.id,
-        )}">更新</button>
+        )}">${escapeHtml(t("siyuanShare.action.update"))}</button>
       <button class="b3-button b3-button--outline" data-action="delete" data-share-id="${escapeAttr(
           s.id,
-        )}">删除</button>
+        )}">${escapeHtml(t("siyuanShare.action.delete"))}</button>
     </div>
   </td>
 </tr>`;
@@ -2678,38 +2807,46 @@ class SiYuanSharePlugin extends Plugin {
 
     this.dockElement.innerHTML = `
 <div class="siyuan-plugin-share__section">
-  <div class="siyuan-plugin-share__title">连接设置</div>
+  <div class="siyuan-plugin-share__title">${escapeHtml(t("siyuanShare.section.connectionSettings"))}</div>
   <div class="siyuan-plugin-share__grid">
-    <div class="siyuan-plugin-share__muted">站点地址</div>
+    <div class="siyuan-plugin-share__muted">${escapeHtml(t("siyuanShare.label.siteUrl"))}</div>
     <input id="sps-site" class="b3-text-field" placeholder="https://example.com" value="${escapeAttr(
       siteUrl,
     )}" />
-    <div class="siyuan-plugin-share__muted">API Key</div>
-    <input id="sps-apikey" type="password" class="b3-text-field" placeholder="API Key" value="${escapeAttr(
-      apiKey,
-    )}" />
+    <div class="siyuan-plugin-share__muted">${escapeHtml(t("siyuanShare.label.apiKey"))}</div>
+    <input id="sps-apikey" type="password" class="b3-text-field" placeholder="${escapeAttr(
+      t("siyuanShare.label.apiKey"),
+    )}" value="${escapeAttr(apiKey)}" />
   </div>
   <div class="siyuan-plugin-share__actions">
-    <button class="b3-button b3-button--outline" data-action="sync-remote">验证并同步</button>
-    <button class="b3-button b3-button--outline" data-action="disconnect">断开连接</button>
+    <button class="b3-button b3-button--outline" data-action="sync-remote">${escapeHtml(
+      t("siyuanShare.action.verifySync"),
+    )}</button>
+    <button class="b3-button b3-button--outline" data-action="disconnect">${escapeHtml(
+      t("siyuanShare.action.disconnect"),
+    )}</button>
   </div>
   <div class="siyuan-plugin-share__muted">${statusLabel}</div>
-  <div class="siyuan-plugin-share__muted">提示：每次操作都会校验 API Key，并与服务器同步分享列表。</div>
+  <div class="siyuan-plugin-share__muted">${escapeHtml(t("siyuanShare.hint.checkApiKey"))}</div>
 </div>
 
 <div class="siyuan-plugin-share__section">
-  <div class="siyuan-plugin-share__title">分享列表 (${this.shares.length})</div>
+  <div class="siyuan-plugin-share__title">${escapeHtml(
+    t("siyuanShare.title.shareListCount", {count: this.shares.length}),
+  )}</div>
   <table class="siyuan-plugin-share__table">
     <thead>
       <tr>
-        <th style="width: 34%;">标题</th>
-        <th style="width: 14%;">类型</th>
-        <th style="width: 36%;">链接</th>
-        <th style="width: 16%;">操作</th>
+        <th style="width: 34%;">${escapeHtml(t("siyuanShare.label.title"))}</th>
+        <th style="width: 14%;">${escapeHtml(t("siyuanShare.label.type"))}</th>
+        <th style="width: 36%;">${escapeHtml(t("siyuanShare.label.link"))}</th>
+        <th style="width: 16%;">${escapeHtml(t("siyuanShare.label.actions"))}</th>
       </tr>
     </thead>
     <tbody>
-      ${rows || `<tr><td colspan="4" class="siyuan-plugin-share__muted">暂无分享记录。</td></tr>`}
+      ${rows || `<tr><td colspan="4" class="siyuan-plugin-share__muted">${escapeHtml(
+          t("siyuanShare.message.noShareRecords"),
+        )}</td></tr>`}
     </tbody>
   </table>
 </div>
