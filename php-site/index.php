@@ -145,6 +145,46 @@ function migrate(PDO $pdo): void {
         FOREIGN KEY(share_id) REFERENCES shares(id)
     );');
 
+    $pdo->exec('CREATE TABLE IF NOT EXISTS share_uploads (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        upload_id TEXT NOT NULL UNIQUE,
+        user_id INTEGER NOT NULL,
+        share_id INTEGER,
+        type TEXT NOT NULL,
+        doc_id TEXT,
+        notebook_id TEXT,
+        slug TEXT,
+        title TEXT,
+        password_hash TEXT,
+        expires_at INTEGER,
+        asset_manifest TEXT,
+        status TEXT NOT NULL DEFAULT "pending",
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(user_id) REFERENCES users(id),
+        FOREIGN KEY(share_id) REFERENCES shares(id)
+    );');
+
+    $pdo->exec('CREATE TABLE IF NOT EXISTS share_upload_docs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        upload_id TEXT NOT NULL,
+        doc_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        hpath TEXT,
+        parent_id TEXT,
+        sort_index INTEGER NOT NULL DEFAULT 0,
+        markdown TEXT NOT NULL,
+        sort_order INTEGER NOT NULL DEFAULT 0,
+        size_bytes INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );');
+
+    $pdo->exec('CREATE TABLE IF NOT EXISTS recycled_share_ids (
+        share_id INTEGER PRIMARY KEY,
+        created_at TEXT NOT NULL
+    );');
+
     $pdo->exec('CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL,
@@ -357,6 +397,10 @@ function email_verification_enabled(): bool {
 
 function smtp_enabled(): bool {
     return get_bool_setting('smtp_enabled', false);
+}
+
+function email_verification_available(): bool {
+    return email_verification_enabled() && smtp_enabled();
 }
 
 function default_storage_limit_bytes(): int {
@@ -670,6 +714,7 @@ function render_page(string $title, string $content, ?array $user = null, string
                 ['key' => 'admin-announcements', 'label' => '公告管理', 'href' => $base . '/admin#announcements'],
                 ['key' => 'admin-users', 'label' => '用户管理', 'href' => $base . '/admin#users'],
                 ['key' => 'admin-shares', 'label' => '分享管理', 'href' => $base . '/admin#shares'],
+                ['key' => 'admin-chunks', 'label' => '分片清理', 'href' => $base . '/admin#chunks'],
                 ['key' => 'admin-scan', 'label' => '违禁词扫描', 'href' => $base . '/admin#scan'],
             ];
         }
@@ -696,7 +741,10 @@ function render_page(string $title, string $content, ?array $user = null, string
         echo "</aside>";
         echo "<div class='app-main'>";
         echo "<header class='app-topbar'>";
-        echo "<div class='topbar-left'><div class='topbar-title'>{$pageTitle}</div></div>";
+        echo "<div class='topbar-left'>";
+        echo "<button class='app-side-trigger' type='button' data-app-drawer-open aria-label='打开导航'><svg viewBox='0 0 24 24' aria-hidden='true'><path fill='currentColor' d='M4 6h16v2H4zM4 11h16v2H4zM4 16h16v2H4z'/></svg></button>";
+        echo "<div class='topbar-title'>{$pageTitle}</div>";
+        echo "</div>";
         echo "<div class='topbar-right'>";
         echo "<span class='user-pill'>{$userName}</span>";
         echo "<form method='post' action='{$base}/logout' class='inline-form'>";
@@ -711,6 +759,7 @@ function render_page(string $title, string $content, ?array $user = null, string
         echo "<footer class='app-footer'>由 <a href='https://github.com/b8l8u8e8/siyuan-plugin-share' target='_blank' rel='noopener noreferrer'>b8l8u8e8</a> 提供支持</footer>";
         echo "</div>";
         echo "</div>";
+        echo "<div class='app-side-backdrop' data-app-drawer-close></div>";
     } else {
         echo "<div class='public-shell'>";
         echo $content;
@@ -1299,6 +1348,38 @@ function remove_dir(string $dir): void {
     @rmdir($dir);
 }
 
+function move_dir(string $source, string $target): bool {
+    if (!is_dir($source)) {
+        return false;
+    }
+    if (is_dir($target)) {
+        remove_dir($target);
+    }
+    ensure_dir(dirname($target));
+    if (@rename($source, $target)) {
+        return true;
+    }
+    ensure_dir($target);
+    $items = scandir($source);
+    if ($items === false) {
+        return false;
+    }
+    foreach ($items as $item) {
+        if ($item === '.' || $item === '..') {
+            continue;
+        }
+        $src = $source . DIRECTORY_SEPARATOR . $item;
+        $dst = $target . DIRECTORY_SEPARATOR . $item;
+        if (is_dir($src)) {
+            move_dir($src, $dst);
+        } else {
+            @copy($src, $dst);
+        }
+    }
+    remove_dir($source);
+    return true;
+}
+
 function chunk_cleanup_settings(): array {
     global $config;
     $ttl = (int)($config['chunk_ttl_seconds'] ?? 7200);
@@ -1346,17 +1427,7 @@ function latest_mtime(string $path): int {
     return $latest;
 }
 
-function maybe_cleanup_chunks(): void {
-    global $config;
-    [$ttl, $prob, $limit] = chunk_cleanup_settings();
-    if ($prob <= 0 || $ttl <= 0 || $limit <= 0) {
-        return;
-    }
-    $rand = mt_rand() / mt_getrandmax();
-    if ($rand > $prob) {
-        return;
-    }
-    $base = $config['uploads_dir'] . '/chunks';
+function cleanup_stale_dirs(string $base, int $ttl, int $limit): void {
     if (!is_dir($base)) {
         return;
     }
@@ -1386,6 +1457,60 @@ function maybe_cleanup_chunks(): void {
     }
 }
 
+function maybe_cleanup_chunks(): void {
+    global $config;
+    [$ttl, $prob, $limit] = chunk_cleanup_settings();
+    if ($prob <= 0 || $ttl <= 0 || $limit <= 0) {
+        return;
+    }
+    $rand = mt_rand() / mt_getrandmax();
+    if ($rand > $prob) {
+        return;
+    }
+    cleanup_stale_dirs($config['uploads_dir'] . '/chunks', $ttl, $limit);
+    cleanup_stale_dirs($config['uploads_dir'] . '/staging', $ttl, $limit);
+}
+
+function list_stale_chunks(int $ttl): array {
+    global $config;
+    $base = $config['uploads_dir'] . '/chunks';
+    if (!is_dir($base)) {
+        return [];
+    }
+    $dirs = scandir($base);
+    if ($dirs === false) {
+        return [];
+    }
+    $now = time();
+    $rows = [];
+    foreach ($dirs as $dir) {
+        if ($dir === '.' || $dir === '..') {
+            continue;
+        }
+        $path = $base . DIRECTORY_SEPARATOR . $dir;
+        if (!is_dir($path)) {
+            continue;
+        }
+        $mtime = latest_mtime($path);
+        if ($mtime <= 0) {
+            continue;
+        }
+        $age = $now - $mtime;
+        if ($age < $ttl) {
+            continue;
+        }
+        $rows[] = [
+            'id' => $dir,
+            'mtime' => $mtime,
+            'age' => $age,
+        ];
+    }
+    usort($rows, function ($a, $b) {
+        return $a['mtime'] <=> $b['mtime'];
+    });
+    return $rows;
+}
+
 function sanitize_asset_path(string $path): string {
     $path = str_replace('\\', '/', $path);
     $path = ltrim($path, '/');
@@ -1393,6 +1518,14 @@ function sanitize_asset_path(string $path): string {
         return '';
     }
     return $path;
+}
+
+function sanitize_upload_id(string $uploadId): string {
+    $uploadId = trim($uploadId);
+    if ($uploadId === '' || !preg_match('/^[a-f0-9]{32}$/', $uploadId)) {
+        return '';
+    }
+    return $uploadId;
 }
 
 function collect_asset_entries(array $files, array $paths, array $docIds): array {
@@ -1423,6 +1556,29 @@ function collect_asset_entries(array $files, array $paths, array $docIds): array
     return $entries;
 }
 
+function allocate_share_id(PDO $pdo): int {
+    $stmt = $pdo->query('SELECT share_id FROM recycled_share_ids ORDER BY share_id ASC LIMIT 1');
+    $shareId = (int)($stmt ? $stmt->fetchColumn() : 0);
+    if ($shareId > 0) {
+        $del = $pdo->prepare('DELETE FROM recycled_share_ids WHERE share_id = :share_id');
+        $del->execute([':share_id' => $shareId]);
+        return $shareId;
+    }
+    return 0;
+}
+
+function recycle_share_id(int $shareId): void {
+    if ($shareId <= 0) {
+        return;
+    }
+    $pdo = db();
+    $stmt = $pdo->prepare('INSERT OR IGNORE INTO recycled_share_ids (share_id, created_at) VALUES (:share_id, :created_at)');
+    $stmt->execute([
+        ':share_id' => $shareId,
+        ':created_at' => now(),
+    ]);
+}
+
 function purge_share_assets(int $shareId): void {
     global $config;
     $pdo = db();
@@ -1445,6 +1601,7 @@ function hard_delete_share(int $shareId): ?int {
     purge_share_chunks($shareId);
     $pdo->prepare('DELETE FROM share_docs WHERE share_id = :share_id')->execute([':share_id' => $shareId]);
     $pdo->prepare('DELETE FROM shares WHERE id = :id')->execute([':id' => $shareId]);
+    recycle_share_id($shareId);
     recalculate_user_storage($userId);
     return $userId;
 }
@@ -1578,6 +1735,25 @@ function share_chunks_dir(int $shareId): string {
     return $config['uploads_dir'] . '/chunks/' . $shareId;
 }
 
+function upload_chunks_dir(string $uploadId): string {
+    global $config;
+    return $config['uploads_dir'] . '/chunks/' . $uploadId;
+}
+
+function upload_staging_dir(string $uploadId): string {
+    global $config;
+    return $config['uploads_dir'] . '/staging/' . $uploadId;
+}
+
+function purge_upload_session_files(string $uploadId): void {
+    remove_dir(upload_chunks_dir($uploadId));
+    remove_dir(upload_staging_dir($uploadId));
+}
+
+function generate_upload_id(): string {
+    return bin2hex(random_bytes(16));
+}
+
 function purge_share_chunks(int $shareId): void {
     $dir = share_chunks_dir($shareId);
     remove_dir($dir);
@@ -1692,7 +1868,7 @@ function handle_api(string $path): void {
         if (!empty($bannedWords)) {
             $hit = find_banned_word($markdown, $bannedWords);
             if ($hit) {
-                api_response(400, null, 'Banned word: ' . $hit['word']);
+                api_response(400, null, '触发违禁词：' . $hit['word']);
             }
         }
         $slug = sanitize_slug((string)($meta['slug'] ?? ''));
@@ -1727,70 +1903,60 @@ function handle_api(string $path): void {
             $expiresValue = $expiresAt;
         }
 
-        $shareId = 0;
+        $finalSlug = $slug;
         if ($existing) {
-            if ($slug && $slug !== $existing['slug']) {
+            if ($finalSlug && $finalSlug !== $existing['slug']) {
                 $check = $pdo->prepare('SELECT id FROM shares WHERE slug = :slug AND deleted_at IS NULL AND id != :id');
-                $check->execute([':slug' => $slug, ':id' => $existing['id']]);
+                $check->execute([':slug' => $finalSlug, ':id' => $existing['id']]);
                 if ($check->fetch()) {
                     api_response(409, null, 'Share link already exists');
                 }
             }
-            $newSlug = $slug ?: $existing['slug'];
-            $stmt = $pdo->prepare('UPDATE shares SET title = :title, slug = :slug, password_hash = :password_hash, expires_at = :expires_at, updated_at = :updated_at, deleted_at = NULL WHERE id = :id');
-            $stmt->execute([
-                ':title' => $title ?: $existing['title'],
-                ':slug' => $newSlug,
-                ':password_hash' => $passwordHash,
-                ':expires_at' => $expiresValue,
-                ':updated_at' => now(),
-                ':id' => $existing['id'],
-            ]);
-            $shareId = (int)$existing['id'];
-            $slug = $newSlug;
+            if (!$finalSlug) {
+                $finalSlug = (string)$existing['slug'];
+            }
         } else {
-            if (!$slug) {
+            if (!$finalSlug) {
                 for ($i = 0; $i < 10; $i++) {
-                    $slug = sanitize_slug(bin2hex(random_bytes(4)));
+                    $finalSlug = sanitize_slug(bin2hex(random_bytes(4)));
                     $check = $pdo->prepare('SELECT id FROM shares WHERE slug = :slug AND deleted_at IS NULL');
-                    $check->execute([':slug' => $slug]);
+                    $check->execute([':slug' => $finalSlug]);
                     if (!$check->fetch()) {
                         break;
                     }
                 }
             } else {
                 $check = $pdo->prepare('SELECT id FROM shares WHERE slug = :slug AND deleted_at IS NULL');
-                $check->execute([':slug' => $slug]);
+                $check->execute([':slug' => $finalSlug]);
                 if ($check->fetch()) {
                     api_response(409, null, 'Share link already exists');
                 }
             }
-            $stmt = $pdo->prepare('INSERT INTO shares (user_id, type, slug, title, doc_id, password_hash, expires_at, created_at, updated_at)
-                VALUES (:uid, "doc", :slug, :title, :doc_id, :password_hash, :expires_at, :created_at, :updated_at)');
-            $stmt->execute([
-                ':uid' => $user['id'],
-                ':slug' => $slug,
-                ':title' => $title ?: $docId,
-                ':doc_id' => $docId,
-                ':password_hash' => $passwordHash,
-                ':expires_at' => $expiresValue,
-                ':created_at' => now(),
-                ':updated_at' => now(),
-            ]);
-            $shareId = (int)$pdo->lastInsertId();
         }
 
-        if ($shareId) {
-            purge_share_assets($shareId);
-            purge_share_chunks($shareId);
-        }
-        $pdo->prepare('DELETE FROM share_docs WHERE share_id = :share_id')->execute([':share_id' => $shareId]);
-        $stmt = $pdo->prepare('INSERT INTO share_docs (share_id, doc_id, title, hpath, parent_id, sort_index, markdown, sort_order, size_bytes, created_at, updated_at)
-            VALUES (:share_id, :doc_id, :title, :hpath, :parent_id, :sort_index, :markdown, :sort_order, :size_bytes, :created_at, :updated_at)');
+        $finalTitle = $title ?: ($existing['title'] ?? $docId);
+        $uploadId = generate_upload_id();
+        $stmt = $pdo->prepare('INSERT INTO share_uploads (upload_id, user_id, share_id, type, doc_id, slug, title, password_hash, expires_at, asset_manifest, status, created_at, updated_at)
+            VALUES (:upload_id, :user_id, :share_id, "doc", :doc_id, :slug, :title, :password_hash, :expires_at, :asset_manifest, "pending", :created_at, :updated_at)');
         $stmt->execute([
-            ':share_id' => $shareId,
+            ':upload_id' => $uploadId,
+            ':user_id' => $user['id'],
+            ':share_id' => $existing ? (int)$existing['id'] : null,
             ':doc_id' => $docId,
-            ':title' => $title ?: $docId,
+            ':slug' => $finalSlug,
+            ':title' => $finalTitle,
+            ':password_hash' => $passwordHash,
+            ':expires_at' => $expiresValue,
+            ':asset_manifest' => json_encode($assets, JSON_UNESCAPED_SLASHES),
+            ':created_at' => now(),
+            ':updated_at' => now(),
+        ]);
+        $stmt = $pdo->prepare('INSERT INTO share_upload_docs (upload_id, doc_id, title, hpath, parent_id, sort_index, markdown, sort_order, size_bytes, created_at, updated_at)
+            VALUES (:upload_id, :doc_id, :title, :hpath, :parent_id, :sort_index, :markdown, :sort_order, :size_bytes, :created_at, :updated_at)');
+        $stmt->execute([
+            ':upload_id' => $uploadId,
+            ':doc_id' => $docId,
+            ':title' => $finalTitle,
             ':hpath' => $hPath,
             ':parent_id' => null,
             ':sort_index' => 0,
@@ -1800,15 +1966,7 @@ function handle_api(string $path): void {
             ':created_at' => now(),
             ':updated_at' => now(),
         ]);
-
-        $stmt = $pdo->prepare('UPDATE shares SET size_bytes = :size_bytes, updated_at = :updated_at WHERE id = :id');
-        $stmt->execute([
-            ':size_bytes' => $docSize,
-            ':updated_at' => now(),
-            ':id' => $shareId,
-        ]);
-        recalculate_user_storage((int)$user['id']);
-        api_response(200, ['shareId' => $shareId, 'slug' => $slug]);
+        api_response(200, ['uploadId' => $uploadId, 'slug' => $finalSlug]);
     }
 
     if ($path === '/api/v1/shares/notebook/init' && $_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -1837,7 +1995,7 @@ function handle_api(string $path): void {
                 $hit = find_banned_word($docMarkdown, $bannedWords);
                 if ($hit) {
                     $docTitle = trim((string)($doc['title'] ?? '')) ?: trim((string)($doc['docId'] ?? ''));
-                    api_response(400, null, 'Banned word: ' . $hit['word'] . ' (doc: ' . $docTitle . ')');
+                    api_response(400, null, '触发违禁词：' . $hit['word'] . '（文档：' . $docTitle . '）');
                 }
             }
         }
@@ -1901,73 +2059,63 @@ function handle_api(string $path): void {
             $expiresValue = $expiresAt;
         }
 
-        $shareId = 0;
+        $finalSlug = $slug;
         if ($existing) {
-            if ($slug && $slug !== $existing['slug']) {
+            if ($finalSlug && $finalSlug !== $existing['slug']) {
                 $check = $pdo->prepare('SELECT id FROM shares WHERE slug = :slug AND deleted_at IS NULL AND id != :id');
-                $check->execute([':slug' => $slug, ':id' => $existing['id']]);
+                $check->execute([':slug' => $finalSlug, ':id' => $existing['id']]);
                 if ($check->fetch()) {
                     api_response(409, null, 'Share link already exists');
                 }
             }
-            $newSlug = $slug ?: $existing['slug'];
-            $stmt = $pdo->prepare('UPDATE shares SET title = :title, slug = :slug, password_hash = :password_hash, expires_at = :expires_at, updated_at = :updated_at, deleted_at = NULL WHERE id = :id');
-            $stmt->execute([
-                ':title' => $title ?: $existing['title'],
-                ':slug' => $newSlug,
-                ':password_hash' => $passwordHash,
-                ':expires_at' => $expiresValue,
-                ':updated_at' => now(),
-                ':id' => $existing['id'],
-            ]);
-            $shareId = (int)$existing['id'];
-            $slug = $newSlug;
+            if (!$finalSlug) {
+                $finalSlug = (string)$existing['slug'];
+            }
         } else {
-            if (!$slug) {
+            if (!$finalSlug) {
                 for ($i = 0; $i < 10; $i++) {
-                    $slug = sanitize_slug(bin2hex(random_bytes(4)));
+                    $finalSlug = sanitize_slug(bin2hex(random_bytes(4)));
                     $check = $pdo->prepare('SELECT id FROM shares WHERE slug = :slug AND deleted_at IS NULL');
-                    $check->execute([':slug' => $slug]);
+                    $check->execute([':slug' => $finalSlug]);
                     if (!$check->fetch()) {
                         break;
                     }
                 }
             } else {
                 $check = $pdo->prepare('SELECT id FROM shares WHERE slug = :slug AND deleted_at IS NULL');
-                $check->execute([':slug' => $slug]);
+                $check->execute([':slug' => $finalSlug]);
                 if ($check->fetch()) {
                     api_response(409, null, 'Share link already exists');
                 }
             }
-            $stmt = $pdo->prepare('INSERT INTO shares (user_id, type, slug, title, notebook_id, password_hash, expires_at, created_at, updated_at)
-                VALUES (:uid, "notebook", :slug, :title, :notebook_id, :password_hash, :expires_at, :created_at, :updated_at)');
-            $stmt->execute([
-                ':uid' => $user['id'],
-                ':slug' => $slug,
-                ':title' => $title ?: $notebookId,
-                ':notebook_id' => $notebookId,
-                ':password_hash' => $passwordHash,
-                ':expires_at' => $expiresValue,
-                ':created_at' => now(),
-                ':updated_at' => now(),
-            ]);
-            $shareId = (int)$pdo->lastInsertId();
         }
 
-        if ($shareId) {
-            purge_share_assets($shareId);
-            purge_share_chunks($shareId);
-        }
-        $pdo->prepare('DELETE FROM share_docs WHERE share_id = :share_id')->execute([':share_id' => $shareId]);
-        $stmt = $pdo->prepare('INSERT INTO share_docs (share_id, doc_id, title, hpath, parent_id, sort_index, markdown, sort_order, size_bytes, created_at, updated_at)
-            VALUES (:share_id, :doc_id, :title, :hpath, :parent_id, :sort_index, :markdown, :sort_order, :size_bytes, :created_at, :updated_at)');
+        $finalTitle = $title ?: ($existing['title'] ?? $notebookId);
+        $uploadId = generate_upload_id();
+        $stmt = $pdo->prepare('INSERT INTO share_uploads (upload_id, user_id, share_id, type, notebook_id, slug, title, password_hash, expires_at, asset_manifest, status, created_at, updated_at)
+            VALUES (:upload_id, :user_id, :share_id, "notebook", :notebook_id, :slug, :title, :password_hash, :expires_at, :asset_manifest, "pending", :created_at, :updated_at)');
+        $stmt->execute([
+            ':upload_id' => $uploadId,
+            ':user_id' => $user['id'],
+            ':share_id' => $existing ? (int)$existing['id'] : null,
+            ':notebook_id' => $notebookId,
+            ':slug' => $finalSlug,
+            ':title' => $finalTitle,
+            ':password_hash' => $passwordHash,
+            ':expires_at' => $expiresValue,
+            ':asset_manifest' => json_encode($assets, JSON_UNESCAPED_SLASHES),
+            ':created_at' => now(),
+            ':updated_at' => now(),
+        ]);
+        $stmt = $pdo->prepare('INSERT INTO share_upload_docs (upload_id, doc_id, title, hpath, parent_id, sort_index, markdown, sort_order, size_bytes, created_at, updated_at)
+            VALUES (:upload_id, :doc_id, :title, :hpath, :parent_id, :sort_index, :markdown, :sort_order, :size_bytes, :created_at, :updated_at)');
         foreach ($docRows as $row) {
             $stmt->execute([
-                ':share_id' => $shareId,
+                ':upload_id' => $uploadId,
                 ':doc_id' => $row['docId'],
                 ':title' => $row['title'],
                 ':hpath' => $row['hPath'],
-                ':parent_id' => $row['parentId'],
+                ':parent_id' => $row['parentId'] !== '' ? $row['parentId'] : null,
                 ':sort_index' => $row['sortIndex'],
                 ':markdown' => $row['markdown'],
                 ':sort_order' => $row['sortOrder'],
@@ -1976,35 +2124,39 @@ function handle_api(string $path): void {
                 ':updated_at' => now(),
             ]);
         }
-
-        $stmt = $pdo->prepare('UPDATE shares SET size_bytes = :size_bytes, updated_at = :updated_at WHERE id = :id');
-        $stmt->execute([
-            ':size_bytes' => $docSizeTotal,
-            ':updated_at' => now(),
-            ':id' => $shareId,
-        ]);
-        recalculate_user_storage((int)$user['id']);
-        api_response(200, ['shareId' => $shareId, 'slug' => $slug]);
+        api_response(200, ['uploadId' => $uploadId, 'slug' => $finalSlug]);
     }
 
     if ($path === '/api/v1/shares/asset/chunk' && $_SERVER['REQUEST_METHOD'] === 'POST') {
-        $shareId = (int)($_POST['shareId'] ?? 0);
+        $uploadId = sanitize_upload_id((string)($_POST['uploadId'] ?? ''));
         $assetPath = sanitize_asset_path((string)($_POST['assetPath'] ?? ''));
         $docId = trim((string)($_POST['assetDocId'] ?? ''));
         $chunkIndex = (int)($_POST['chunkIndex'] ?? -1);
         $totalChunks = (int)($_POST['totalChunks'] ?? 0);
-        $totalSize = (int)($_POST['totalSize'] ?? 0);
-        if (!$shareId || $assetPath === '' || $chunkIndex < 0 || $totalChunks <= 0 || $chunkIndex >= $totalChunks) {
+        if ($uploadId === '' || $assetPath === '' || $chunkIndex < 0 || $totalChunks <= 0 || $chunkIndex >= $totalChunks) {
             api_response(400, null, 'Invalid chunk request');
         }
-        $check = $pdo->prepare('SELECT * FROM shares WHERE id = :id AND user_id = :uid AND deleted_at IS NULL');
+        $check = $pdo->prepare('SELECT * FROM share_uploads WHERE upload_id = :upload_id AND user_id = :uid AND status = "pending" LIMIT 1');
         $check->execute([
-            ':id' => $shareId,
+            ':upload_id' => $uploadId,
             ':uid' => $user['id'],
         ]);
-        $share = $check->fetch(PDO::FETCH_ASSOC);
-        if (!$share) {
-            api_response(404, null, 'Share not found');
+        $upload = $check->fetch(PDO::FETCH_ASSOC);
+        if (!$upload) {
+            api_response(404, null, 'Upload not found');
+        }
+        $manifest = json_decode((string)($upload['asset_manifest'] ?? ''), true);
+        $manifest = is_array($manifest) ? $manifest : [];
+        $manifestItem = null;
+        foreach ($manifest as $item) {
+            $path = sanitize_asset_path((string)($item['path'] ?? ''));
+            if ($path !== '' && $path === $assetPath) {
+                $manifestItem = $item;
+                break;
+            }
+        }
+        if (!$manifestItem) {
+            api_response(400, null, 'Asset not allowed');
         }
         if (empty($_FILES['chunk'])) {
             api_response(400, null, 'Missing chunk file');
@@ -2015,7 +2167,7 @@ function handle_api(string $path): void {
             api_response(400, null, 'Invalid chunk upload');
         }
 
-        $chunkDir = share_chunks_dir($shareId);
+        $chunkDir = upload_chunks_dir($uploadId);
         $chunkPath = $chunkDir . '/' . $assetPath . '.part' . $chunkIndex;
         ensure_dir(dirname($chunkPath));
         if (!move_uploaded_file($tmp, $chunkPath)) {
@@ -2030,7 +2182,7 @@ function handle_api(string $path): void {
                     api_response(400, null, 'Missing chunk');
                 }
             }
-            $targetFile = $config['uploads_dir'] . '/shares/' . $shareId . '/' . $assetPath;
+            $targetFile = upload_staging_dir($uploadId) . '/' . $assetPath;
             ensure_dir(dirname($targetFile));
             $out = fopen($targetFile, 'wb');
             if ($out === false) {
@@ -2054,46 +2206,252 @@ function handle_api(string $path): void {
                 @unlink($part);
             }
             fclose($out);
-            $actualSize = is_file($targetFile) ? (int)filesize($targetFile) : 0;
-            if ($actualSize <= 0 && $totalSize > 0) {
-                $actualSize = $totalSize;
-            }
-
-            $stmt = $pdo->prepare('SELECT COALESCE(SUM(size_bytes), 0) AS total FROM share_docs WHERE share_id = :share_id');
-            $stmt->execute([':share_id' => $shareId]);
-            $docSize = (int)$stmt->fetchColumn();
-            $stmt = $pdo->prepare('SELECT COALESCE(SUM(size_bytes), 0) AS total FROM share_assets WHERE share_id = :share_id');
-            $stmt->execute([':share_id' => $shareId]);
-            $assetSize = (int)$stmt->fetchColumn();
-            $stmt = $pdo->prepare('SELECT size_bytes FROM share_assets WHERE share_id = :share_id AND asset_path = :asset_path LIMIT 1');
-            $stmt->execute([':share_id' => $shareId, ':asset_path' => $assetPath]);
-            $existingAssetSize = (int)($stmt->fetchColumn() ?: 0);
-            $currentShareSize = $docSize + $assetSize;
-            $newShareSize = $docSize + ($assetSize - $existingAssetSize + $actualSize);
-            $used = recalculate_user_storage((int)$user['id']);
-            $limit = get_user_limit_bytes($user);
-            $usedWithout = max(0, $used - $currentShareSize);
-            if ($limit > 0 && ($usedWithout + $newShareSize) > $limit) {
-                @unlink($targetFile);
-                api_response(413, null, 'Storage limit reached');
-            }
-
-            $stmt = $pdo->prepare('INSERT OR REPLACE INTO share_assets (share_id, doc_id, asset_path, file_path, size_bytes, created_at)
-                VALUES (:share_id, :doc_id, :asset_path, :file_path, :size_bytes, :created_at)');
-            $stmt->execute([
-                ':share_id' => $shareId,
-                ':doc_id' => $docId !== '' ? $docId : null,
-                ':asset_path' => $assetPath,
-                ':file_path' => 'shares/' . $shareId . '/' . $assetPath,
-                ':size_bytes' => $actualSize,
-                ':created_at' => now(),
-            ]);
-            recalculate_share_size($shareId);
-            recalculate_user_storage((int)$user['id']);
             $complete = true;
         }
-
+        $stmt = $pdo->prepare('UPDATE share_uploads SET updated_at = :updated_at WHERE upload_id = :upload_id');
+        $stmt->execute([
+            ':updated_at' => now(),
+            ':upload_id' => $uploadId,
+        ]);
         api_response(200, ['complete' => $complete]);
+    }
+
+    if ($path === '/api/v1/shares/upload/complete' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+        $payload = parse_json_body();
+        $uploadId = sanitize_upload_id((string)($payload['uploadId'] ?? ''));
+        if ($uploadId === '') {
+            api_response(400, null, 'Missing upload id');
+        }
+        $stmt = $pdo->prepare('SELECT * FROM share_uploads WHERE upload_id = :upload_id AND user_id = :uid AND status = "pending" LIMIT 1');
+        $stmt->execute([
+            ':upload_id' => $uploadId,
+            ':uid' => $user['id'],
+        ]);
+        $upload = $stmt->fetch(PDO::FETCH_ASSOC);
+        if (!$upload) {
+            api_response(404, null, 'Upload not found');
+        }
+
+        $docStmt = $pdo->prepare('SELECT * FROM share_upload_docs WHERE upload_id = :upload_id ORDER BY id ASC');
+        $docStmt->execute([':upload_id' => $uploadId]);
+        $docRows = $docStmt->fetchAll(PDO::FETCH_ASSOC);
+        if (empty($docRows)) {
+            api_response(400, null, 'Missing documents');
+        }
+        $docSizeTotal = 0;
+        foreach ($docRows as $row) {
+            $docSizeTotal += (int)($row['size_bytes'] ?? 0);
+        }
+
+        $manifest = json_decode((string)($upload['asset_manifest'] ?? ''), true);
+        $manifest = is_array($manifest) ? $manifest : [];
+        $assetSizeTotal = 0;
+        $stagingDir = upload_staging_dir($uploadId);
+        $manifestEntries = [];
+        foreach ($manifest as $item) {
+            $path = sanitize_asset_path((string)($item['path'] ?? ''));
+            if ($path === '') {
+                continue;
+            }
+            $full = $stagingDir . '/' . $path;
+            if (!is_file($full)) {
+                api_response(400, null, 'Missing asset: ' . $path);
+            }
+            $size = (int)filesize($full);
+            $assetSizeTotal += $size;
+            $manifestEntries[] = [
+                'path' => $path,
+                'docId' => isset($item['docId']) ? trim((string)$item['docId']) : null,
+                'size' => $size,
+            ];
+        }
+
+        $share = null;
+        $shareId = (int)($upload['share_id'] ?? 0);
+        if ($shareId > 0) {
+            $check = $pdo->prepare('SELECT * FROM shares WHERE id = :id AND user_id = :uid LIMIT 1');
+            $check->execute([
+                ':id' => $shareId,
+                ':uid' => $user['id'],
+            ]);
+            $share = $check->fetch(PDO::FETCH_ASSOC) ?: null;
+            if (!$share) {
+                $shareId = 0;
+            }
+        }
+
+        $newShareSize = $docSizeTotal + $assetSizeTotal;
+        $existingSize = $share ? (int)($share['size_bytes'] ?? 0) : 0;
+        $used = recalculate_user_storage((int)$user['id']);
+        $limit = get_user_limit_bytes($user);
+        $usedWithout = max(0, $used - $existingSize);
+        if ($limit > 0 && ($usedWithout + $newShareSize) > $limit) {
+            api_response(413, null, 'Storage limit reached');
+        }
+
+        $slug = sanitize_slug((string)($upload['slug'] ?? ''));
+        if ($slug === '') {
+            for ($i = 0; $i < 10; $i++) {
+                $slug = sanitize_slug(bin2hex(random_bytes(4)));
+                $check = $pdo->prepare('SELECT id FROM shares WHERE slug = :slug AND deleted_at IS NULL');
+                $check->execute([':slug' => $slug]);
+                if (!$check->fetch()) {
+                    break;
+                }
+            }
+        } else {
+            $check = $pdo->prepare('SELECT id FROM shares WHERE slug = :slug AND deleted_at IS NULL');
+            $check->execute([':slug' => $slug]);
+            $rowId = (int)($check->fetchColumn() ?: 0);
+            if ($rowId && (!$share || $rowId !== (int)$share['id'])) {
+                api_response(409, null, 'Share link already exists');
+            }
+        }
+
+        $title = trim((string)($upload['title'] ?? ''));
+        $passwordHash = $upload['password_hash'] ?? null;
+        $expiresValue = isset($upload['expires_at']) ? (int)$upload['expires_at'] : null;
+        $type = (string)($upload['type'] ?? 'doc');
+        $docId = trim((string)($upload['doc_id'] ?? ''));
+        $notebookId = trim((string)($upload['notebook_id'] ?? ''));
+
+        $pdo->beginTransaction();
+        try {
+            if ($share) {
+                $update = $pdo->prepare('UPDATE shares SET title = :title, slug = :slug, password_hash = :password_hash, expires_at = :expires_at, updated_at = :updated_at, deleted_at = NULL WHERE id = :id');
+                $update->execute([
+                    ':title' => $title !== '' ? $title : ($share['title'] ?? $slug),
+                    ':slug' => $slug,
+                    ':password_hash' => $passwordHash,
+                    ':expires_at' => $expiresValue,
+                    ':updated_at' => now(),
+                    ':id' => $share['id'],
+                ]);
+                $shareId = (int)$share['id'];
+                purge_share_assets($shareId);
+                purge_share_chunks($shareId);
+                $pdo->prepare('DELETE FROM share_docs WHERE share_id = :share_id')->execute([':share_id' => $shareId]);
+            } else {
+                $shareId = allocate_share_id($pdo);
+                if ($shareId > 0) {
+                    $stmt = $pdo->prepare('INSERT INTO shares (id, user_id, type, slug, title, doc_id, notebook_id, password_hash, expires_at, created_at, updated_at)
+                        VALUES (:id, :uid, :type, :slug, :title, :doc_id, :notebook_id, :password_hash, :expires_at, :created_at, :updated_at)');
+                    $stmt->execute([
+                        ':id' => $shareId,
+                        ':uid' => $user['id'],
+                        ':type' => $type,
+                        ':slug' => $slug,
+                        ':title' => $title !== '' ? $title : $slug,
+                        ':doc_id' => $type === 'doc' ? $docId : null,
+                        ':notebook_id' => $type === 'notebook' ? $notebookId : null,
+                        ':password_hash' => $passwordHash,
+                        ':expires_at' => $expiresValue,
+                        ':created_at' => now(),
+                        ':updated_at' => now(),
+                    ]);
+                } else {
+                    $stmt = $pdo->prepare('INSERT INTO shares (user_id, type, slug, title, doc_id, notebook_id, password_hash, expires_at, created_at, updated_at)
+                        VALUES (:uid, :type, :slug, :title, :doc_id, :notebook_id, :password_hash, :expires_at, :created_at, :updated_at)');
+                    $stmt->execute([
+                        ':uid' => $user['id'],
+                        ':type' => $type,
+                        ':slug' => $slug,
+                        ':title' => $title !== '' ? $title : $slug,
+                        ':doc_id' => $type === 'doc' ? $docId : null,
+                        ':notebook_id' => $type === 'notebook' ? $notebookId : null,
+                        ':password_hash' => $passwordHash,
+                        ':expires_at' => $expiresValue,
+                        ':created_at' => now(),
+                        ':updated_at' => now(),
+                    ]);
+                    $shareId = (int)$pdo->lastInsertId();
+                }
+            }
+
+            $insertDoc = $pdo->prepare('INSERT INTO share_docs (share_id, doc_id, title, hpath, parent_id, sort_index, markdown, sort_order, size_bytes, created_at, updated_at)
+                VALUES (:share_id, :doc_id, :title, :hpath, :parent_id, :sort_index, :markdown, :sort_order, :size_bytes, :created_at, :updated_at)');
+            foreach ($docRows as $row) {
+                $insertDoc->execute([
+                    ':share_id' => $shareId,
+                    ':doc_id' => $row['doc_id'],
+                    ':title' => $row['title'],
+                    ':hpath' => $row['hpath'],
+                    ':parent_id' => $row['parent_id'] ?? null,
+                    ':sort_index' => $row['sort_index'] ?? 0,
+                    ':markdown' => $row['markdown'],
+                    ':sort_order' => $row['sort_order'] ?? 0,
+                    ':size_bytes' => $row['size_bytes'] ?? 0,
+                    ':created_at' => now(),
+                    ':updated_at' => now(),
+                ]);
+            }
+
+            $targetDir = $config['uploads_dir'] . '/shares/' . $shareId;
+            if (is_dir($stagingDir)) {
+                move_dir($stagingDir, $targetDir);
+            } else {
+                ensure_dir($targetDir);
+            }
+
+            if (!empty($manifestEntries)) {
+                $assetStmt = $pdo->prepare('INSERT OR REPLACE INTO share_assets (share_id, doc_id, asset_path, file_path, size_bytes, created_at)
+                    VALUES (:share_id, :doc_id, :asset_path, :file_path, :size_bytes, :created_at)');
+                foreach ($manifestEntries as $entry) {
+                    $assetStmt->execute([
+                        ':share_id' => $shareId,
+                        ':doc_id' => $entry['docId'] !== '' ? $entry['docId'] : null,
+                        ':asset_path' => $entry['path'],
+                        ':file_path' => 'shares/' . $shareId . '/' . $entry['path'],
+                        ':size_bytes' => $entry['size'],
+                        ':created_at' => now(),
+                    ]);
+                }
+            }
+
+            $updateSize = $pdo->prepare('UPDATE shares SET size_bytes = :size_bytes, updated_at = :updated_at WHERE id = :id');
+            $updateSize->execute([
+                ':size_bytes' => $newShareSize,
+                ':updated_at' => now(),
+                ':id' => $shareId,
+            ]);
+
+            $pdo->prepare('DELETE FROM share_upload_docs WHERE upload_id = :upload_id')->execute([':upload_id' => $uploadId]);
+            $pdo->prepare('DELETE FROM share_uploads WHERE upload_id = :upload_id')->execute([':upload_id' => $uploadId]);
+            $pdo->commit();
+        } catch (Throwable $e) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            api_response(500, null, 'Upload finalize failed');
+        }
+
+        purge_upload_session_files($uploadId);
+        recalculate_user_storage((int)$user['id']);
+        api_response(200, [
+            'shareId' => $shareId,
+            'slug' => $slug,
+            'url' => share_url($slug),
+        ]);
+    }
+
+    if ($path === '/api/v1/shares/upload/cancel' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+        $payload = parse_json_body();
+        $uploadId = sanitize_upload_id((string)($payload['uploadId'] ?? ''));
+        if ($uploadId === '') {
+            api_response(400, null, 'Missing upload id');
+        }
+        $stmt = $pdo->prepare('SELECT id FROM share_uploads WHERE upload_id = :upload_id AND user_id = :uid LIMIT 1');
+        $stmt->execute([
+            ':upload_id' => $uploadId,
+            ':uid' => $user['id'],
+        ]);
+        if (!$stmt->fetchColumn()) {
+            api_response(404, null, 'Upload not found');
+        }
+        $pdo->prepare('DELETE FROM share_upload_docs WHERE upload_id = :upload_id')->execute([':upload_id' => $uploadId]);
+        $pdo->prepare('DELETE FROM share_uploads WHERE upload_id = :upload_id')->execute([':upload_id' => $uploadId]);
+        purge_upload_session_files($uploadId);
+        api_response(200, ['ok' => true]);
     }
 
     if ($path === '/api/v1/shares/doc') {
@@ -2200,19 +2558,36 @@ function handle_api(string $path): void {
                     api_response(409, null, '分享链接已被占用');
                 }
             }
-            $stmt = $pdo->prepare('INSERT INTO shares (user_id, type, slug, title, doc_id, password_hash, expires_at, created_at, updated_at)
-                VALUES (:uid, "doc", :slug, :title, :doc_id, :password_hash, :expires_at, :created_at, :updated_at)');
-            $stmt->execute([
-                ':uid' => $user['id'],
-                ':slug' => $slug,
-                ':title' => $title ?: $docId,
-                ':doc_id' => $docId,
-                ':password_hash' => $passwordHash,
-                ':expires_at' => $expiresValue,
-                ':created_at' => now(),
-                ':updated_at' => now(),
-            ]);
-            $shareId = (int)$pdo->lastInsertId();
+            $shareId = allocate_share_id($pdo);
+            if ($shareId > 0) {
+                $stmt = $pdo->prepare('INSERT INTO shares (id, user_id, type, slug, title, doc_id, password_hash, expires_at, created_at, updated_at)
+                    VALUES (:id, :uid, "doc", :slug, :title, :doc_id, :password_hash, :expires_at, :created_at, :updated_at)');
+                $stmt->execute([
+                    ':id' => $shareId,
+                    ':uid' => $user['id'],
+                    ':slug' => $slug,
+                    ':title' => $title ?: $docId,
+                    ':doc_id' => $docId,
+                    ':password_hash' => $passwordHash,
+                    ':expires_at' => $expiresValue,
+                    ':created_at' => now(),
+                    ':updated_at' => now(),
+                ]);
+            } else {
+                $stmt = $pdo->prepare('INSERT INTO shares (user_id, type, slug, title, doc_id, password_hash, expires_at, created_at, updated_at)
+                    VALUES (:uid, "doc", :slug, :title, :doc_id, :password_hash, :expires_at, :created_at, :updated_at)');
+                $stmt->execute([
+                    ':uid' => $user['id'],
+                    ':slug' => $slug,
+                    ':title' => $title ?: $docId,
+                    ':doc_id' => $docId,
+                    ':password_hash' => $passwordHash,
+                    ':expires_at' => $expiresValue,
+                    ':created_at' => now(),
+                    ':updated_at' => now(),
+                ]);
+                $shareId = (int)$pdo->lastInsertId();
+            }
         }
 
         if ($existing) {
@@ -2389,19 +2764,36 @@ function handle_api(string $path): void {
                     api_response(409, null, '分享链接已被占用');
                 }
             }
-            $stmt = $pdo->prepare('INSERT INTO shares (user_id, type, slug, title, notebook_id, password_hash, expires_at, created_at, updated_at)
-                VALUES (:uid, "notebook", :slug, :title, :notebook_id, :password_hash, :expires_at, :created_at, :updated_at)');
-            $stmt->execute([
-                ':uid' => $user['id'],
-                ':slug' => $slug,
-                ':title' => $title ?: $notebookId,
-                ':notebook_id' => $notebookId,
-                ':password_hash' => $passwordHash,
-                ':expires_at' => $expiresValue,
-                ':created_at' => now(),
-                ':updated_at' => now(),
-            ]);
-            $shareId = (int)$pdo->lastInsertId();
+            $shareId = allocate_share_id($pdo);
+            if ($shareId > 0) {
+                $stmt = $pdo->prepare('INSERT INTO shares (id, user_id, type, slug, title, notebook_id, password_hash, expires_at, created_at, updated_at)
+                    VALUES (:id, :uid, "notebook", :slug, :title, :notebook_id, :password_hash, :expires_at, :created_at, :updated_at)');
+                $stmt->execute([
+                    ':id' => $shareId,
+                    ':uid' => $user['id'],
+                    ':slug' => $slug,
+                    ':title' => $title ?: $notebookId,
+                    ':notebook_id' => $notebookId,
+                    ':password_hash' => $passwordHash,
+                    ':expires_at' => $expiresValue,
+                    ':created_at' => now(),
+                    ':updated_at' => now(),
+                ]);
+            } else {
+                $stmt = $pdo->prepare('INSERT INTO shares (user_id, type, slug, title, notebook_id, password_hash, expires_at, created_at, updated_at)
+                    VALUES (:uid, "notebook", :slug, :title, :notebook_id, :password_hash, :expires_at, :created_at, :updated_at)');
+                $stmt->execute([
+                    ':uid' => $user['id'],
+                    ':slug' => $slug,
+                    ':title' => $title ?: $notebookId,
+                    ':notebook_id' => $notebookId,
+                    ':password_hash' => $passwordHash,
+                    ':expires_at' => $expiresValue,
+                    ':created_at' => now(),
+                    ':updated_at' => now(),
+                ]);
+                $shareId = (int)$pdo->lastInsertId();
+            }
         }
 
         if ($existing) {
@@ -2939,93 +3331,130 @@ if ($path === '/email-code' && $_SERVER['REQUEST_METHOD'] === 'POST') {
         flash('error', '当前未开放注册');
         redirect('/register');
     }
-    if (!email_verification_enabled()) {
+    if (!email_verification_available()) {
         redirect('/register');
     }
-    $email = trim((string)($_POST['email'] ?? ''));
-    $captchaInput = (string)($_POST['captcha'] ?? '');
-    if (captcha_enabled() && !check_captcha($captchaInput)) {
-        flash('error', '验证码错误');
+    $email = trim((string)($_POST['email'] ?? ($_SESSION['register_email'] ?? '')));
+    $_SESSION['register_email'] = $email;
+    if (($_SESSION['register_step'] ?? '') !== 'verify') {
+        flash('error', '请先完成注册信息');
         redirect('/register');
+    }
+    $captchaInput = (string)($_POST['captcha'] ?? '');
+    if (captcha_enabled() && $captchaInput !== '' && !check_captcha($captchaInput)) {
+        flash('error', '验证码错误');
+        redirect('/register?step=verify');
     }
     if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
         flash('error', '邮箱格式不正确');
-        redirect('/register');
+        redirect('/register?step=verify');
     }
-    $lastSent = (int)($_SESSION['email_code_at'] ?? 0);
+    $lastSent = (int)($_SESSION['register_email_code_at'] ?? 0);
     if ($lastSent && (time() - $lastSent) < 60) {
         flash('error', '请稍后再发送验证码');
-        redirect('/register');
+        redirect('/register?step=verify');
     }
     $code = create_email_code($email, $_SERVER['REMOTE_ADDR'] ?? '');
     if (!send_email_code($email, $code)) {
         flash('error', '验证码发送失败，请检查邮件配置');
-        redirect('/register');
+        redirect('/register?step=verify');
     }
-    $_SESSION['email_code_at'] = time();
-    $_SESSION['register_email'] = $email;
-    flash('info', '验证码已发送，请查收邮箱');
-    redirect('/register');
+    $_SESSION['register_email_code_at'] = time();
+    flash('info', '验证码已发送，请查收邮件');
+    redirect('/register?step=verify');
 }
 
-if ($path === '/login/email-code' && $_SERVER['REQUEST_METHOD'] === 'POST') {
-    if (!email_verification_enabled()) {
+if ($path === '/login/email/prepare' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    if (!email_verification_available()) {
         redirect('/login');
     }
     check_csrf();
     $email = trim((string)($_POST['email'] ?? ''));
     $captchaInput = (string)($_POST['captcha'] ?? '');
+    $_SESSION['login_email'] = $email;
+    $_SESSION['login_tab'] = 'email';
     if (captcha_enabled() && !check_captcha($captchaInput)) {
         flash('error', '验证码错误');
-        redirect('/login');
+        redirect('/login?tab=email');
     }
     if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
         flash('error', '邮箱格式不正确');
+        redirect('/login?tab=email');
+    }
+    $pdo = db();
+    $stmt = $pdo->prepare('SELECT disabled FROM users WHERE email = :email LIMIT 1');
+    $stmt->execute([':email' => $email]);
+    $userRow = $stmt->fetch(PDO::FETCH_ASSOC);
+    if (!$userRow) {
+        flash('error', '该邮箱未注册');
+        redirect('/login?tab=email');
+    }
+    if ((int)$userRow['disabled'] === 1) {
+        flash('error', '账号已被停用');
+        redirect('/login?tab=email');
+    }
+    $_SESSION['login_email_step'] = 'verify';
+    redirect('/login?tab=email&step=verify');
+}
+
+if ($path === '/login/email-code' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    if (!email_verification_available()) {
         redirect('/login');
+    }
+    check_csrf();
+    if (($_SESSION['login_email_step'] ?? '') !== 'verify') {
+        flash('error', '请先输入邮箱');
+        redirect('/login?tab=email');
+    }
+    $email = trim((string)($_POST['email'] ?? ($_SESSION['login_email'] ?? '')));
+    $_SESSION['login_email'] = $email;
+    $_SESSION['login_tab'] = 'email';
+    if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+        flash('error', '邮箱格式不正确');
+        redirect('/login?tab=email&step=verify');
     }
     $pdo = db();
     $stmt = $pdo->prepare('SELECT id FROM users WHERE email = :email LIMIT 1');
     $stmt->execute([':email' => $email]);
     if (!$stmt->fetchColumn()) {
         flash('error', '该邮箱未注册');
-        redirect('/login');
+        redirect('/login?tab=email&step=verify');
     }
     $lastSent = (int)($_SESSION['login_email_code_at'] ?? 0);
     if ($lastSent && (time() - $lastSent) < 60) {
         flash('error', '请稍后再发送验证码');
-        redirect('/login');
+        redirect('/login?tab=email&step=verify');
     }
     $code = create_email_code($email, $_SERVER['REMOTE_ADDR'] ?? '');
     if (!send_email_code($email, $code)) {
         flash('error', '验证码发送失败，请检查邮件配置');
-        redirect('/login');
+        redirect('/login?tab=email&step=verify');
     }
     $_SESSION['login_email_code_at'] = time();
-    $_SESSION['login_email'] = $email;
-    flash('info', '验证码已发送，请查收邮箱');
-    redirect('/login');
+    flash('info', '验证码已发送，请查收邮件');
+    redirect('/login?tab=email&step=verify');
 }
 
 if ($path === '/login/email' && $_SERVER['REQUEST_METHOD'] === 'POST') {
-    if (!email_verification_enabled()) {
+    if (!email_verification_available()) {
         redirect('/login');
     }
     check_csrf();
-    $email = trim((string)($_POST['email'] ?? ''));
-    $code = trim((string)($_POST['email_code'] ?? ''));
-    $captchaInput = (string)($_POST['captcha'] ?? '');
-    if (captcha_enabled() && !check_captcha($captchaInput)) {
-        flash('error', '验证码错误');
-        redirect('/login');
+    if (($_SESSION['login_email_step'] ?? '') !== 'verify') {
+        flash('error', '请先输入邮箱');
+        redirect('/login?tab=email');
     }
+    $email = trim((string)($_POST['email'] ?? ($_SESSION['login_email'] ?? '')));
+    $code = trim((string)($_POST['email_code'] ?? ''));
+    $_SESSION['login_email'] = $email;
+    $_SESSION['login_tab'] = 'email';
     if ($email === '' || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
         flash('error', '邮箱格式不正确');
-        redirect('/login');
+        redirect('/login?tab=email&step=verify');
     }
-    $_SESSION['login_email'] = $email;
     if ($code === '' || !verify_email_code($email, $code)) {
         flash('error', '邮箱验证码错误');
-        redirect('/login');
+        redirect('/login?tab=email&step=verify');
     }
     $pdo = db();
     $stmt = $pdo->prepare('SELECT * FROM users WHERE email = :email LIMIT 1');
@@ -3033,13 +3462,15 @@ if ($path === '/login/email' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     $user = $stmt->fetch(PDO::FETCH_ASSOC);
     if (!$user) {
         flash('error', '该邮箱未注册');
-        redirect('/login');
+        redirect('/login?tab=email&step=verify');
     }
     if ((int)$user['disabled'] === 1) {
         flash('error', '账号已被停用');
-        redirect('/login');
+        redirect('/login?tab=email&step=verify');
     }
     $_SESSION['user_id'] = $user['id'];
+    $_SESSION['login_email_step'] = 'start';
+    unset($_SESSION['login_email']);
     if ((int)$user['email_verified'] !== 1) {
         $update = $pdo->prepare('UPDATE users SET email_verified = 1, updated_at = :updated_at WHERE id = :id');
         $update->execute([':updated_at' => now(), ':id' => $user['id']]);
@@ -3058,6 +3489,8 @@ if ($path === '/login') {
         $username = trim((string)($_POST['username'] ?? ''));
         $password = (string)($_POST['password'] ?? '');
         $captchaInput = (string)($_POST['captcha'] ?? '');
+        $_SESSION['login_username'] = $username;
+        $_SESSION['login_tab'] = 'password';
         if (captcha_enabled() && !check_captcha($captchaInput)) {
             flash('error', '验证码错误');
             redirect('/login');
@@ -3075,6 +3508,8 @@ if ($path === '/login') {
             redirect('/login');
         }
         $_SESSION['user_id'] = $user['id'];
+        $_SESSION['login_email_step'] = 'start';
+        unset($_SESSION['login_username']);
         if ((int)$user['must_change_password'] === 1) {
             flash('info', '检测到默认密码，请先修改密码');
             redirect('/account');
@@ -3088,8 +3523,35 @@ if ($path === '/login') {
     $iconMail = '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M20 4H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2zm0 4-8 5-8-5V6l8 5 8-5z"/></svg>';
     $iconLock = '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M17 9h-1V7a4 4 0 0 0-8 0v2H7a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-8a2 2 0 0 0-2-2zm-6 8v-2a1 1 0 0 1 2 0v2zm3-8H10V7a2 2 0 0 1 4 0z"/></svg>';
     $iconShield = '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2 4 5v6c0 5 3.6 9.2 8 11 4.4-1.8 8-6 8-11V5z"/></svg>';
+    $tabQuery = (string)($_GET['tab'] ?? '');
+    if ($tabQuery !== '') {
+        $_SESSION['login_tab'] = $tabQuery;
+    }
+    $stepQuery = (string)($_GET['step'] ?? '');
+    if ($stepQuery === 'verify') {
+        $_SESSION['login_email_step'] = 'verify';
+    } elseif ($stepQuery === 'prepare') {
+        $_SESSION['login_email_step'] = 'start';
+    }
     $prefillLoginEmail = $_SESSION['login_email'] ?? '';
-    $loginTab = (email_verification_enabled() && $prefillLoginEmail) ? 'email' : 'password';
+    $prefillLoginUser = $_SESSION['login_username'] ?? '';
+    $loginEmailStep = $_SESSION['login_email_step'] ?? 'start';
+    if (!email_verification_available()) {
+        $loginEmailStep = 'start';
+    }
+    if ($loginEmailStep === 'verify' && $prefillLoginEmail === '') {
+        $loginEmailStep = 'start';
+    }
+    $loginTab = email_verification_available()
+        ? (($_SESSION['login_tab'] ?? '') ?: ($loginEmailStep === 'verify' ? 'email' : 'password'))
+        : 'password';
+    if (!in_array($loginTab, ['password', 'email'], true)) {
+        $loginTab = 'password';
+    }
+    $lastLoginSent = (int)($_SESSION['login_email_code_at'] ?? 0);
+    $nextLoginCodeAt = ($lastLoginSent && (time() - $lastLoginSent) < 60) ? ($lastLoginSent + 60) : 0;
+    $nextLoginAttr = $nextLoginCodeAt ? ' data-countdown-until="' . ($nextLoginCodeAt * 1000) . '"' : '';
+
     $content = '<div class="auth-card">';
     $content .= '<div class="auth-logo">' . $brand . '</div>';
     $content .= '<div class="auth-title">账号登录</div>';
@@ -3100,7 +3562,7 @@ if ($path === '/login') {
     if ($info) {
         $content .= '<div class="alert info">' . htmlspecialchars($info) . '</div>';
     }
-    if (email_verification_enabled()) {
+    if (email_verification_available()) {
         $content .= '<div class="auth-tabs" data-login-tabs data-login-default="' . $loginTab . '">';
         $content .= '<button class="auth-tab" type="button" data-login-tab="password">密码登录</button>';
         $content .= '<button class="auth-tab" type="button" data-login-tab="email">邮箱验证码</button>';
@@ -3108,7 +3570,7 @@ if ($path === '/login') {
     }
     $content .= '<form method="post" class="auth-form" data-login-panel="password"' . ($loginTab === 'password' ? '' : ' hidden') . '>';
     $content .= '<input type="hidden" name="csrf" value="' . csrf_token() . '">';
-    $content .= '<div class="auth-field"><span class="auth-icon">' . $iconUser . '</span><input class="auth-input" name="username" placeholder="用户名" required></div>';
+    $content .= '<div class="auth-field"><span class="auth-icon">' . $iconUser . '</span><input class="auth-input" name="username" placeholder="用户名" value="' . htmlspecialchars((string)$prefillLoginUser) . '" required></div>';
     $content .= '<div class="auth-field"><span class="auth-icon">' . $iconLock . '</span><input class="auth-input" type="password" name="password" placeholder="密码" required></div>';
     if (captcha_enabled()) {
         $content .= '<div class="auth-field auth-field-captcha"><span class="auth-icon">' . $iconShield . '</span><input class="auth-input" name="captcha" placeholder="验证码" required>';
@@ -3117,18 +3579,29 @@ if ($path === '/login') {
     $content .= '<div class="auth-actions"><a class="link" href="' . base_path() . '/forgot">找回密码</a></div>';
     $content .= '<button class="button primary w-full" type="submit">登录</button>';
     $content .= '</form>';
-    if (email_verification_enabled()) {
-        $content .= '<form method="post" class="auth-form" action="' . base_path() . '/login/email" data-login-panel="email"' . ($loginTab === 'email' ? '' : ' hidden') . '>';
-        $content .= '<input type="hidden" name="csrf" value="' . csrf_token() . '">';
-        $content .= '<div class="auth-field"><span class="auth-icon">' . $iconMail . '</span><input class="auth-input" name="email" placeholder="邮箱" value="' . htmlspecialchars((string)$prefillLoginEmail) . '" required></div>';
-        $content .= '<div class="auth-field"><span class="auth-icon">' . $iconMail . '</span><input class="auth-input" name="email_code" placeholder="邮箱验证码" required></div>';
-        if (captcha_enabled()) {
-            $content .= '<div class="auth-field auth-field-captcha"><span class="auth-icon">' . $iconShield . '</span><input class="auth-input" name="captcha" placeholder="验证码" required>';
-            $content .= '<img class="captcha-img" src="' . htmlspecialchars(captcha_url()) . '" alt="验证码" data-captcha></div>';
+    if (email_verification_available()) {
+        if ($loginEmailStep === 'verify') {
+            $content .= '<form method="post" class="auth-form" action="' . base_path() . '/login/email" data-login-panel="email"' . ($loginTab === 'email' ? '' : ' hidden') . '>';
+            $content .= '<input type="hidden" name="csrf" value="' . csrf_token() . '">';
+            $content .= '<div class="auth-field"><span class="auth-icon">' . $iconMail . '</span><input class="auth-input" name="email" placeholder="邮箱" value="' . htmlspecialchars((string)$prefillLoginEmail) . '" readonly></div>';
+            $content .= '<div class="auth-field"><span class="auth-icon">' . $iconMail . '</span><input class="auth-input" name="email_code" placeholder="邮箱验证码" required></div>';
+            $content .= '<div class="auth-actions">';
+            $content .= '<button class="button ghost" type="submit" formaction="' . base_path() . '/login/email-code" formnovalidate' . $nextLoginAttr . '>发送邮箱验证码</button>';
+            $content .= '<a class="link" href="' . base_path() . '/login?tab=email&step=prepare">修改邮箱</a>';
+            $content .= '</div>';
+            $content .= '<button class="button primary w-full" type="submit">登录</button>';
+            $content .= '</form>';
+        } else {
+            $content .= '<form method="post" class="auth-form" action="' . base_path() . '/login/email/prepare" data-login-panel="email"' . ($loginTab === 'email' ? '' : ' hidden') . '>';
+            $content .= '<input type="hidden" name="csrf" value="' . csrf_token() . '">';
+            $content .= '<div class="auth-field"><span class="auth-icon">' . $iconMail . '</span><input class="auth-input" name="email" placeholder="邮箱" value="' . htmlspecialchars((string)$prefillLoginEmail) . '" required></div>';
+            if (captcha_enabled()) {
+                $content .= '<div class="auth-field auth-field-captcha"><span class="auth-icon">' . $iconShield . '</span><input class="auth-input" name="captcha" placeholder="验证码" required>';
+                $content .= '<img class="captcha-img" src="' . htmlspecialchars(captcha_url()) . '" alt="验证码" data-captcha></div>';
+            }
+            $content .= '<button class="button primary w-full" type="submit">下一步</button>';
+            $content .= '</form>';
         }
-        $content .= '<div class="auth-actions"><button class="button ghost" type="submit" formaction="' . base_path() . '/login/email-code" formnovalidate>发送邮箱验证码</button></div>';
-        $content .= '<button class="button primary w-full" type="submit">登录</button>';
-        $content .= '</form>';
     }
     $content .= '<div class="auth-footer">没有账号？ <a class="link" href="' . base_path() . '/register">立即注册</a></div>';
     $content .= '</div>';
@@ -3142,49 +3615,106 @@ if ($path === '/register') {
     }
     if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         check_csrf();
-        $username = trim((string)($_POST['username'] ?? ''));
-        $email = trim((string)($_POST['email'] ?? ''));
+        $step = trim((string)($_POST['step'] ?? 'info'));
+        $username = trim((string)($_POST['username'] ?? ($_SESSION['register_username'] ?? '')));
+        $email = trim((string)($_POST['email'] ?? ($_SESSION['register_email'] ?? '')));
         $password = (string)($_POST['password'] ?? '');
         $captchaInput = (string)($_POST['captcha'] ?? '');
-        if (captcha_enabled() && !check_captcha($captchaInput)) {
+        $_SESSION['register_username'] = $username;
+        $_SESSION['register_email'] = $email;
+        if ($step === 'info' && captcha_enabled() && !check_captcha($captchaInput)) {
             flash('error', '验证码错误');
             redirect('/register');
         }
-        if ($username === '' || $password === '') {
-            flash('error', '用户名和密码不能为空');
-            redirect('/register');
-        }
-        if (strlen($password) < 6) {
-            flash('error', '密码至少 6 位');
-            redirect('/register');
-        }
-        $emailVerified = 0;
-        if (email_verification_enabled()) {
-            $emailCode = trim((string)($_POST['email_code'] ?? ''));
-            if ($email === '' || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
-                flash('error', '邮箱格式不正确');
+        if ($step === 'info') {
+            if ($username === '' || $password === '') {
+                flash('error', '用户名和密码不能为空');
                 redirect('/register');
             }
-            if ($emailCode === '' || !verify_email_code($email, $emailCode)) {
-                flash('error', '邮箱验证码错误');
+            if (strlen($password) < 6) {
+                flash('error', '密码至少 6 位');
                 redirect('/register');
             }
-            $emailVerified = 1;
-        } else {
+            if (email_verification_available()) {
+                if ($email === '' || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+                    flash('error', '邮箱格式不正确');
+                    redirect('/register');
+                }
+                $_SESSION['register_password_hash'] = password_hash($password, PASSWORD_DEFAULT);
+                $_SESSION['register_step'] = 'verify';
+                redirect('/register?step=verify');
+            }
+
             if ($email !== '' && !filter_var($email, FILTER_VALIDATE_EMAIL)) {
                 flash('error', '邮箱格式不正确');
                 redirect('/register');
             }
             $emailVerified = $email !== '' ? 1 : 0;
-        }
-        $pdo = db();
-        if ($email !== '') {
-            $checkEmail = $pdo->prepare('SELECT id FROM users WHERE email = :email LIMIT 1');
-            $checkEmail->execute([':email' => $email]);
-            if ($checkEmail->fetch()) {
-                flash('error', '该邮箱已注册');
+            $pdo = db();
+            if ($email !== '') {
+                $checkEmail = $pdo->prepare('SELECT id FROM users WHERE email = :email LIMIT 1');
+                $checkEmail->execute([':email' => $email]);
+                if ($checkEmail->fetch()) {
+                    flash('error', '该邮箱已注册');
+                    redirect('/register');
+                }
+            }
+            $stmt = $pdo->prepare('INSERT INTO users (username, email, password_hash, role, api_key_hash, api_key_prefix, api_key_last4, disabled, storage_limit_bytes, storage_used_bytes, must_change_password, email_verified, created_at, updated_at)
+                VALUES (:username, :email, :password_hash, :role, :api_key_hash, :api_key_prefix, :api_key_last4, :disabled, :storage_limit_bytes, :storage_used_bytes, :must_change_password, :email_verified, :created_at, :updated_at)');
+            try {
+                $stmt->execute([
+                    ':username' => $username,
+                    ':email' => $email,
+                    ':password_hash' => password_hash($password, PASSWORD_DEFAULT),
+                    ':role' => 'user',
+                    ':api_key_hash' => null,
+                    ':api_key_prefix' => null,
+                    ':api_key_last4' => null,
+                    ':disabled' => 0,
+                    ':storage_limit_bytes' => 0,
+                    ':storage_used_bytes' => 0,
+                    ':must_change_password' => 0,
+                    ':email_verified' => $emailVerified,
+                    ':created_at' => now(),
+                    ':updated_at' => now(),
+                ]);
+            } catch (PDOException $e) {
+                flash('error', '用户名已存在');
                 redirect('/register');
             }
+            unset($_SESSION['register_step'], $_SESSION['register_password_hash'], $_SESSION['register_email_code_at'], $_SESSION['register_username'], $_SESSION['register_email']);
+            $_SESSION['user_id'] = (int)$pdo->lastInsertId();
+            redirect('/dashboard');
+        }
+
+        if (!email_verification_available()) {
+            redirect('/register');
+        }
+        $passwordHash = (string)($_SESSION['register_password_hash'] ?? '');
+        if ($passwordHash === '') {
+            $_SESSION['register_step'] = 'info';
+            flash('error', '请先填写注册信息');
+            redirect('/register');
+        }
+        $emailCode = trim((string)($_POST['email_code'] ?? ''));
+        if ($username === '') {
+            flash('error', '用户名不能为空');
+            redirect('/register?step=verify');
+        }
+        if ($email === '' || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            flash('error', '邮箱格式不正确');
+            redirect('/register?step=verify');
+        }
+        if ($emailCode === '' || !verify_email_code($email, $emailCode)) {
+            flash('error', '邮箱验证码错误');
+            redirect('/register?step=verify');
+        }
+        $pdo = db();
+        $checkEmail = $pdo->prepare('SELECT id FROM users WHERE email = :email LIMIT 1');
+        $checkEmail->execute([':email' => $email]);
+        if ($checkEmail->fetch()) {
+            flash('error', '该邮箱已注册');
+            redirect('/register?step=verify');
         }
         $stmt = $pdo->prepare('INSERT INTO users (username, email, password_hash, role, api_key_hash, api_key_prefix, api_key_last4, disabled, storage_limit_bytes, storage_used_bytes, must_change_password, email_verified, created_at, updated_at)
             VALUES (:username, :email, :password_hash, :role, :api_key_hash, :api_key_prefix, :api_key_last4, :disabled, :storage_limit_bytes, :storage_used_bytes, :must_change_password, :email_verified, :created_at, :updated_at)');
@@ -3192,7 +3722,7 @@ if ($path === '/register') {
             $stmt->execute([
                 ':username' => $username,
                 ':email' => $email,
-                ':password_hash' => password_hash($password, PASSWORD_DEFAULT),
+                ':password_hash' => $passwordHash,
                 ':role' => 'user',
                 ':api_key_hash' => null,
                 ':api_key_prefix' => null,
@@ -3201,25 +3731,50 @@ if ($path === '/register') {
                 ':storage_limit_bytes' => 0,
                 ':storage_used_bytes' => 0,
                 ':must_change_password' => 0,
-                ':email_verified' => $emailVerified,
+                ':email_verified' => 1,
                 ':created_at' => now(),
                 ':updated_at' => now(),
             ]);
         } catch (PDOException $e) {
             flash('error', '用户名已存在');
-            redirect('/register');
+            redirect('/register?step=verify');
         }
+        unset(
+            $_SESSION['register_step'],
+            $_SESSION['register_password_hash'],
+            $_SESSION['register_email_code_at'],
+            $_SESSION['register_username'],
+            $_SESSION['register_email']
+        );
         $_SESSION['user_id'] = (int)$pdo->lastInsertId();
         redirect('/dashboard');
     }
     $error = flash('error');
     $info = flash('info');
+    $stepQuery = (string)($_GET['step'] ?? '');
+    if ($stepQuery === 'verify') {
+        $_SESSION['register_step'] = 'verify';
+    } elseif ($stepQuery === 'info') {
+        $_SESSION['register_step'] = 'info';
+    }
+    $registerStep = $_SESSION['register_step'] ?? 'info';
+    if (!email_verification_available()) {
+        $registerStep = 'info';
+    }
+    if ($registerStep === 'verify' && empty($_SESSION['register_password_hash'])) {
+        $registerStep = 'info';
+    }
+    $_SESSION['register_step'] = $registerStep;
+    $prefillName = $_SESSION['register_username'] ?? '';
     $prefillEmail = $_SESSION['register_email'] ?? '';
     $brand = htmlspecialchars($config['app_name']);
     $iconUser = '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 12a4 4 0 1 0-4-4 4 4 0 0 0 4 4zm0 2c-4.4 0-8 2.2-8 5v1h16v-1c0-2.8-3.6-5-8-5z"/></svg>';
     $iconMail = '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M20 4H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2zm0 4-8 5-8-5V6l8 5 8-5z"/></svg>';
     $iconLock = '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M17 9h-1V7a4 4 0 0 0-8 0v2H7a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-8a2 2 0 0 0-2-2zm-6 8v-2a1 1 0 0 1 2 0v2zm3-8H10V7a2 2 0 0 1 4 0z"/></svg>';
     $iconShield = '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2 4 5v6c0 5 3.6 9.2 8 11 4.4-1.8 8-6 8-11V5z"/></svg>';
+    $lastSent = (int)($_SESSION['register_email_code_at'] ?? 0);
+    $nextCodeAt = ($lastSent && (time() - $lastSent) < 60) ? ($lastSent + 60) : 0;
+    $nextCodeAttr = $nextCodeAt ? ' data-countdown-until="' . ($nextCodeAt * 1000) . '"' : '';
     $content = '<div class="auth-card">';
     $content .= '<div class="auth-logo">' . $brand . '</div>';
     $content .= '<div class="auth-title">注册账号</div>';
@@ -3230,24 +3785,42 @@ if ($path === '/register') {
     if ($info) {
         $content .= '<div class="alert info">' . htmlspecialchars($info) . '</div>';
     }
-    $content .= '<form method="post" class="auth-form">';
-    $content .= '<input type="hidden" name="csrf" value="' . csrf_token() . '">';
-    $content .= '<div class="auth-field"><span class="auth-icon">' . $iconUser . '</span><input class="auth-input" name="username" placeholder="用户名" required></div>';
-    $content .= '<div class="auth-field"><span class="auth-icon">' . $iconMail . '</span><input class="auth-input" name="email" placeholder="邮箱" value="' . htmlspecialchars((string)$prefillEmail) . '"' . (email_verification_enabled() ? ' required' : '') . '></div>';
-    $content .= '<div class="auth-field"><span class="auth-icon">' . $iconLock . '</span><input class="auth-input" type="password" name="password" placeholder="密码" required></div>';
-    if (email_verification_enabled()) {
+    if (email_verification_available()) {
+        $content .= '<div class="auth-steps">';
+        $content .= '<div class="auth-step' . ($registerStep === 'info' ? ' is-active' : '') . '"><span>1</span>填写信息</div>';
+        $content .= '<div class="auth-step' . ($registerStep === 'verify' ? ' is-active' : '') . '"><span>2</span>邮箱验证</div>';
+        $content .= '</div>';
+    }
+    if ($registerStep === 'verify' && email_verification_available()) {
+        $content .= '<form method="post" class="auth-form">';
+        $content .= '<input type="hidden" name="csrf" value="' . csrf_token() . '">';
+        $content .= '<input type="hidden" name="step" value="verify">';
+        $content .= '<div class="auth-field"><span class="auth-icon">' . $iconUser . '</span><input class="auth-input" name="username" placeholder="用户名" value="' . htmlspecialchars((string)$prefillName) . '" readonly></div>';
+        $content .= '<div class="auth-field"><span class="auth-icon">' . $iconMail . '</span><input class="auth-input" name="email" placeholder="邮箱" value="' . htmlspecialchars((string)$prefillEmail) . '" readonly></div>';
         $content .= '<div class="auth-field"><span class="auth-icon">' . $iconMail . '</span><input class="auth-input" name="email_code" placeholder="邮箱验证码" required></div>';
+        $content .= '<div class="auth-actions">';
+        $content .= '<button class="button ghost" type="submit" formaction="' . base_path() . '/email-code" formnovalidate' . $nextCodeAttr . '>发送邮箱验证码</button>';
+        $content .= '<a class="link" href="' . base_path() . '/register?step=info">修改信息</a>';
+        $content .= '</div>';
+        $content .= '<button class="button primary w-full" type="submit">注册</button>';
+        $content .= '<div class="auth-footer">已有账号？ <a class="link" href="' . base_path() . '/login">立即登录</a></div>';
+        $content .= '</form>';
+    } else {
+        $content .= '<form method="post" class="auth-form">';
+        $content .= '<input type="hidden" name="csrf" value="' . csrf_token() . '">';
+        $content .= '<input type="hidden" name="step" value="info">';
+        $content .= '<div class="auth-field"><span class="auth-icon">' . $iconUser . '</span><input class="auth-input" name="username" placeholder="用户名" value="' . htmlspecialchars((string)$prefillName) . '" required></div>';
+        $content .= '<div class="auth-field"><span class="auth-icon">' . $iconMail . '</span><input class="auth-input" name="email" placeholder="邮箱" value="' . htmlspecialchars((string)$prefillEmail) . '"' . (email_verification_available() ? ' required' : '') . '></div>';
+        $content .= '<div class="auth-field"><span class="auth-icon">' . $iconLock . '</span><input class="auth-input" type="password" name="password" placeholder="密码" required></div>';
+        if (captcha_enabled()) {
+            $content .= '<div class="auth-field auth-field-captcha"><span class="auth-icon">' . $iconShield . '</span><input class="auth-input" name="captcha" placeholder="验证码" required>';
+            $content .= '<img class="captcha-img" src="' . htmlspecialchars(captcha_url()) . '" alt="验证码" data-captcha></div>';
+        }
+        $content .= '<button class="button primary w-full" type="submit">' . (email_verification_available() ? '下一步' : '注册') . '</button>';
+        $content .= '<div class="auth-footer">已有账号？ <a class="link" href="' . base_path() . '/login">立即登录</a></div>';
+        $content .= '</form>';
     }
-    if (captcha_enabled()) {
-        $content .= '<div class="auth-field auth-field-captcha"><span class="auth-icon">' . $iconShield . '</span><input class="auth-input" name="captcha" placeholder="验证码" required>';
-        $content .= '<img class="captcha-img" src="' . htmlspecialchars(captcha_url()) . '" alt="验证码" data-captcha></div>';
-    }
-    if (email_verification_enabled()) {
-        $content .= '<div class="auth-actions"><button class="button ghost" type="submit" formaction="' . base_path() . '/email-code" formnovalidate>发送邮箱验证码</button></div>';
-    }
-    $content .= '<button class="button primary w-full" type="submit">注册</button>';
-    $content .= '<div class="auth-footer">已有账号？ <a class="link" href="' . base_path() . '/login">立即登录</a></div>';
-    $content .= '</form></div>';
+    $content .= '</div>';
     render_page('注册', $content, null, '', ['layout' => 'auth']);
 }
 
@@ -3635,6 +4208,8 @@ if ($path === '/admin') {
     $scanTotal = count($scanResults);
     [$scanPage, $scanSize, $scanPages, $scanOffset] = paginate($scanTotal, $scanPage, $scanSize);
     $scanPageResults = array_slice($scanResults, $scanOffset, $scanSize);
+    [$chunkTtlSeconds] = chunk_cleanup_settings();
+    $staleChunks = list_stale_chunks($chunkTtlSeconds);
     $allUsers = $pdo->query('SELECT id, username FROM users ORDER BY username ASC')->fetchAll(PDO::FETCH_ASSOC);
     $userSearch = trim((string)($_GET['user_search'] ?? ''));
     $userStatus = (string)($_GET['user_status'] ?? 'all');
@@ -4037,6 +4612,38 @@ if ($path === '/admin') {
     $content .= '<button class="button" type="submit">跳转</button>';
     $content .= '</form>';
     $content .= '</div>';
+    $content .= '</div>';
+
+    $chunkTtlHours = $chunkTtlSeconds > 0 ? ($chunkTtlSeconds / 3600) : 2;
+    $content .= '<div class="card" id="chunks"><h2>分片清理</h2>';
+    $content .= '<div class="muted">仅显示超过 ' . htmlspecialchars(number_format($chunkTtlHours, 1)) . ' 小时未更新的分片目录。</div>';
+    if (empty($staleChunks)) {
+        $content .= '<p class="muted" style="margin-top:12px">暂无过期分片。</p>';
+    } else {
+        $content .= '<form method="post" action="' . base_path() . '/admin/chunk-clean" class="inline-form" style="margin-top:12px">';
+        $content .= '<input type="hidden" name="csrf" value="' . csrf_token() . '">';
+        $content .= '<button class="button danger" type="submit">清理全部过期分片</button>';
+        $content .= '</form>';
+        $content .= '<table class="table" style="margin-top:12px"><thead><tr><th>目录</th><th>最后更新</th><th>已过期</th><th>操作</th></tr></thead><tbody>';
+        foreach ($staleChunks as $chunk) {
+            $chunkId = (string)$chunk['id'];
+            $mtime = (int)$chunk['mtime'];
+            $ageHours = max(0, $chunk['age'] / 3600);
+            $content .= '<tr>';
+            $content .= '<td><span class="muted">' . htmlspecialchars($chunkId) . '</span></td>';
+            $content .= '<td>' . htmlspecialchars(date('Y-m-d H:i', $mtime)) . '</td>';
+            $content .= '<td>' . htmlspecialchars(number_format($ageHours, 1)) . ' 小时</td>';
+            $content .= '<td class="actions">';
+            $content .= '<form method="post" action="' . base_path() . '/admin/chunk-delete" class="inline-form">';
+            $content .= '<input type="hidden" name="csrf" value="' . csrf_token() . '">';
+            $content .= '<input type="hidden" name="chunk_id" value="' . htmlspecialchars($chunkId) . '">';
+            $content .= '<button class="button danger" type="submit">删除</button>';
+            $content .= '</form>';
+            $content .= '</td>';
+            $content .= '</tr>';
+        }
+        $content .= '</tbody></table>';
+    }
     $content .= '</div>';
 
     $content .= '<div class="card" id="scan"><h2>违禁词扫描</h2>';
@@ -4602,6 +5209,40 @@ if ($path === '/admin/share-hard-delete' && $_SERVER['REQUEST_METHOD'] === 'POST
         flash('info', '分享已彻底删除');
     }
     redirect('/admin#shares');
+}
+
+if ($path === '/admin/chunk-delete' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    require_admin();
+    check_csrf();
+    global $config;
+    $chunkId = trim((string)($_POST['chunk_id'] ?? ''));
+    if ($chunkId === '' || !preg_match('/^[a-zA-Z0-9_-]+$/', $chunkId)) {
+        redirect('/admin#chunks');
+    }
+    $path = $config['uploads_dir'] . '/chunks/' . $chunkId;
+    remove_dir($path);
+    $stage = $config['uploads_dir'] . '/staging/' . $chunkId;
+    remove_dir($stage);
+    redirect('/admin#chunks');
+}
+
+if ($path === '/admin/chunk-clean' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    require_admin();
+    check_csrf();
+    global $config;
+    [$ttl] = chunk_cleanup_settings();
+    $stale = list_stale_chunks($ttl);
+    foreach ($stale as $chunk) {
+        $chunkId = (string)($chunk['id'] ?? '');
+        if ($chunkId === '' || !preg_match('/^[a-zA-Z0-9_-]+$/', $chunkId)) {
+            continue;
+        }
+        $path = $config['uploads_dir'] . '/chunks/' . $chunkId;
+        remove_dir($path);
+        $stage = $config['uploads_dir'] . '/staging/' . $chunkId;
+        remove_dir($stage);
+    }
+    redirect('/admin#chunks');
 }
 
 if ($path === '/admin/scan/start' && $_SERVER['REQUEST_METHOD'] === 'POST') {

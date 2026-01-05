@@ -686,6 +686,56 @@ label {
   text-align: left;
 }
 
+.auth-steps {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.auth-step {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface-muted);
+  color: var(--muted);
+  font-size: 0.84rem;
+  font-weight: 600;
+}
+
+.auth-step span {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #dbe3ff;
+  color: #4054c7;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+
+.auth-step.is-active {
+  background: #eef3ff;
+  border-color: #c9d6ff;
+  color: #2b3a6f;
+}
+
+.auth-step.is-active span {
+  background: var(--primary);
+  color: #fff;
+}
+
+@media (max-width: 460px) {
+  .auth-steps {
+    grid-template-columns: 1fr;
+  }
+}
+
 .auth-divider {
   display: flex;
   align-items: center;
@@ -794,6 +844,9 @@ label {
 .auth-actions {
   display: flex;
   justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
 }
 
 .auth-footer {
@@ -876,6 +929,49 @@ label {
   position: sticky;
   top: 0;
   z-index: 10;
+}
+
+.topbar-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.app-side-trigger {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--primary-700);
+  cursor: pointer;
+}
+
+.app-side-trigger svg {
+  width: 20px;
+  height: 20px;
+}
+
+.app-side-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.45);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 200ms ease;
+  z-index: 8;
+}
+
+body.app-side-open .app-side-backdrop {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+body.app-side-open {
+  overflow: hidden;
 }
 
 .topbar-title {
@@ -1695,9 +1791,12 @@ label {
 
 .markdown-body .katex-display {
   overflow-x: auto;
+  overflow-y: hidden;
   max-width: 100%;
   -webkit-overflow-scrolling: touch;
   touch-action: pan-x;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
 }
 
 .markdown-body pre code {
@@ -1780,6 +1879,15 @@ body.share-side-open .share-side-backdrop {
 
 .katex-block {
   overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.markdown-body .katex-display::-webkit-scrollbar,
+.katex-block::-webkit-scrollbar {
+  width: 0;
+  height: 0;
 }
 
 .markdown-body table {
@@ -1952,33 +2060,56 @@ body.share-side-open .share-side-backdrop {
 
 @media (max-width: 960px) {
   .app-shell {
-    flex-direction: column;
+    display: block;
   }
 
   .app-sidebar {
-    width: 100%;
-    height: auto;
-    position: static;
-    border-right: none;
-    border-bottom: 1px solid var(--border);
-    display: grid;
-    gap: 12px;
+    width: min(78vw, 280px);
+    height: 100vh;
+    position: fixed;
+    top: 0;
+    left: 0;
+    border-right: 1px solid var(--border);
+    border-bottom: none;
+    transform: translateX(-100%);
+    transition: transform 200ms ease, opacity 200ms ease;
+    opacity: 0;
+    pointer-events: none;
+    z-index: 9;
+  }
+
+  body.app-side-open .app-sidebar {
+    transform: translateX(0);
+    opacity: 1;
+    pointer-events: auto;
   }
 
   .app-nav {
-    grid-auto-flow: column;
-    grid-auto-columns: minmax(140px, 1fr);
-    overflow-x: auto;
+    grid-auto-flow: row;
   }
 
   .app-topbar {
-    flex-direction: column;
-    align-items: flex-start;
+    align-items: center;
     gap: 12px;
+  }
+
+  .app-side-trigger {
+    display: inline-flex;
   }
 
   .search-box {
     width: 100%;
+  }
+
+  .table {
+    display: block;
+    overflow-x: auto;
+    width: 100%;
+  }
+
+  .table th,
+  .table td {
+    white-space: nowrap;
   }
 
   .share-shell {

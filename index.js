@@ -33,6 +33,8 @@ const REMOTE_API = {
   shareNotebookInit: "/api/v1/shares/notebook/init",
   shareNotebook: "/api/v1/shares/notebook",
   shareAssetChunk: "/api/v1/shares/asset/chunk",
+  shareUploadComplete: "/api/v1/shares/upload/complete",
+  shareUploadCancel: "/api/v1/shares/upload/cancel",
   deleteShare: "/api/v1/shares/delete",
 };
 
@@ -2242,10 +2244,10 @@ class SiYuanSharePlugin extends Plugin {
     });
   }
 
-  async uploadAssetsChunked(shareId, entries, controller, progress, totalBytes = 0) {
+  async uploadAssetsChunked(uploadId, entries, controller, progress, totalBytes = 0) {
     const t = this.t.bind(this);
-    if (!shareId) {
-      throw new Error(t("siyuanShare.error.remoteRequestFailed", {status: "missing share id"}));
+    if (!uploadId) {
+      throw new Error(t("siyuanShare.error.remoteRequestFailed", {status: "missing upload id"}));
     }
     if (!Array.isArray(entries) || entries.length === 0) return;
     const total = entries.length;
@@ -2271,7 +2273,7 @@ class SiYuanSharePlugin extends Plugin {
       } else {
         progress?.update?.(label);
       }
-      await this.uploadAssetInChunks(shareId, asset, docId, controller, progress, tracker, label);
+      await this.uploadAssetInChunks(uploadId, asset, docId, controller, progress, tracker, label);
     }
     if (tracker) {
       progress?.update?.({
@@ -2282,7 +2284,7 @@ class SiYuanSharePlugin extends Plugin {
     }
   }
 
-  async uploadAssetInChunks(shareId, asset, docId, controller, progress, tracker, label) {
+  async uploadAssetInChunks(uploadId, asset, docId, controller, progress, tracker, label) {
     const t = this.t.bind(this);
     const blob = asset?.blob;
     const assetPath = asset?.path;
@@ -2296,7 +2298,7 @@ class SiYuanSharePlugin extends Plugin {
       const end = Math.min(size, start + chunkSize);
       const chunk = blob.slice(start, end);
       const form = new FormData();
-      form.append("shareId", String(shareId));
+      form.append("uploadId", String(uploadId));
       form.append("assetPath", assetPath);
       if (docId) form.append("assetDocId", String(docId));
       form.append("chunkIndex", String(index));
@@ -2392,6 +2394,8 @@ class SiYuanSharePlugin extends Plugin {
       }
       progress.update(t("siyuanShare.progress.uploadingContent"));
       let requestError = null;
+      let uploadId = "";
+      let uploadComplete = false;
       try {
         const init = await this.remoteRequest(REMOTE_API.shareDocInit, {
           method: "POST",
@@ -2400,17 +2404,35 @@ class SiYuanSharePlugin extends Plugin {
           controller,
           progress,
         });
-        const shareId = init?.shareId;
-        if (!shareId) {
-          throw new Error(t("siyuanShare.error.remoteRequestFailed", {status: "missing share id"}));
+        uploadId = init?.uploadId;
+        if (!uploadId) {
+          throw new Error(t("siyuanShare.error.remoteRequestFailed", {status: "missing upload id"}));
         }
         const totalBytes = assetEntries.reduce(
           (sum, entry) => sum + (Number(entry.asset?.blob?.size) || 0),
           0,
         );
-        await this.uploadAssetsChunked(shareId, assetEntries, controller, progress, totalBytes);
+        await this.uploadAssetsChunked(uploadId, assetEntries, controller, progress, totalBytes);
+        await this.remoteRequest(REMOTE_API.shareUploadComplete, {
+          method: "POST",
+          body: {uploadId},
+          progressText: t("siyuanShare.progress.uploadingContent"),
+          progress,
+        });
+        uploadComplete = true;
       } catch (err) {
         requestError = err;
+        if (uploadId && !uploadComplete) {
+          try {
+            await this.remoteRequest(REMOTE_API.shareUploadCancel, {
+              method: "POST",
+              body: {uploadId},
+              progress,
+            });
+          } catch (cancelErr) {
+            console.warn("shareDoc cancel upload failed", cancelErr);
+          }
+        }
       }
       progress.update(t("siyuanShare.progress.syncingShareList"));
       let syncError = null;
@@ -2528,6 +2550,8 @@ class SiYuanSharePlugin extends Plugin {
       }));
       progress.update(t("siyuanShare.progress.uploadingContent"));
       let requestError = null;
+      let uploadId = "";
+      let uploadComplete = false;
       try {
         const init = await this.remoteRequest(REMOTE_API.shareNotebookInit, {
           method: "POST",
@@ -2536,17 +2560,35 @@ class SiYuanSharePlugin extends Plugin {
           controller,
           progress,
         });
-        const shareId = init?.shareId;
-        if (!shareId) {
-          throw new Error(t("siyuanShare.error.remoteRequestFailed", {status: "missing share id"}));
+        uploadId = init?.uploadId;
+        if (!uploadId) {
+          throw new Error(t("siyuanShare.error.remoteRequestFailed", {status: "missing upload id"}));
         }
         const totalBytes = assetEntries.reduce(
           (sum, entry) => sum + (Number(entry.asset?.blob?.size) || 0),
           0,
         );
-        await this.uploadAssetsChunked(shareId, assetEntries, controller, progress, totalBytes);
+        await this.uploadAssetsChunked(uploadId, assetEntries, controller, progress, totalBytes);
+        await this.remoteRequest(REMOTE_API.shareUploadComplete, {
+          method: "POST",
+          body: {uploadId},
+          progressText: t("siyuanShare.progress.uploadingContent"),
+          progress,
+        });
+        uploadComplete = true;
       } catch (err) {
         requestError = err;
+        if (uploadId && !uploadComplete) {
+          try {
+            await this.remoteRequest(REMOTE_API.shareUploadCancel, {
+              method: "POST",
+              body: {uploadId},
+              progress,
+            });
+          } catch (cancelErr) {
+            console.warn("shareNotebook cancel upload failed", cancelErr);
+          }
+        }
       }
       progress.update(t("siyuanShare.progress.syncingShareList"));
       let syncError = null;

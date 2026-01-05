@@ -395,6 +395,47 @@
     }
   };
 
+  const initAppDrawer = () => {
+    const openBtn = document.querySelector("[data-app-drawer-open]");
+    const backdrop = document.querySelector("[data-app-drawer-close]");
+    const sidebar = document.querySelector(".app-sidebar");
+    if (!sidebar) return;
+    const setOpen = (open) => {
+      document.body.classList.toggle("app-side-open", open);
+    };
+    if (openBtn) {
+      openBtn.addEventListener("click", () => setOpen(true));
+    }
+    if (backdrop) {
+      backdrop.addEventListener("click", () => setOpen(false));
+    }
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") setOpen(false);
+    });
+    document.querySelectorAll(".app-sidebar a").forEach((link) => {
+      link.addEventListener("click", () => setOpen(false));
+    });
+    const mq = window.matchMedia("(max-width: 960px)");
+    const updateTrigger = () => {
+      const shouldShow = mq.matches;
+      if (openBtn) {
+        openBtn.hidden = !shouldShow;
+        openBtn.style.display = shouldShow ? "inline-flex" : "none";
+      }
+      if (!shouldShow) {
+        setOpen(false);
+      }
+    };
+    if (typeof mq.addEventListener === "function") {
+      mq.addEventListener("change", updateTrigger);
+    } else if (typeof mq.addListener === "function") {
+      mq.addListener(updateTrigger);
+    }
+    window.addEventListener("resize", updateTrigger, {passive: true});
+    window.addEventListener("orientationchange", updateTrigger, {passive: true});
+    requestAnimationFrame(updateTrigger);
+  };
+
   const initScrollTop = () => {
     const btn = document.querySelector("[data-scroll-top]");
     if (!btn) return;
@@ -433,6 +474,29 @@
       });
     });
     setActive(defaultTab);
+  };
+
+  const initCountdownButtons = () => {
+    const buttons = Array.from(document.querySelectorAll("[data-countdown-until]"));
+    if (!buttons.length) return;
+    buttons.forEach((btn) => {
+      const until = Number(btn.dataset.countdownUntil || 0);
+      if (!Number.isFinite(until)) return;
+      const baseText = btn.dataset.countdownText || btn.textContent || "";
+      const tick = () => {
+        const remaining = Math.max(0, until - Date.now());
+        if (remaining <= 0) {
+          btn.disabled = false;
+          btn.textContent = baseText;
+          return;
+        }
+        const seconds = Math.ceil(remaining / 1000);
+        btn.disabled = true;
+        btn.textContent = `${baseText} (${seconds}s)`;
+        window.setTimeout(tick, 1000);
+      };
+      tick();
+    });
   };
 
   const initBatchSelection = () => {
@@ -903,6 +967,8 @@
   }
   initShareSidebarTabs();
   initShareDrawer();
+  initAppDrawer();
   initScrollTop();
   initLoginTabs();
+  initCountdownButtons();
 })();
