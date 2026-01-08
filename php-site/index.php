@@ -1,8 +1,17 @@
 <?php
 declare(strict_types=1);
 
+$exampleVersion = null;
+if (file_exists(__DIR__ . '/config.example.php')) {
+    $exampleConfig = require __DIR__ . '/config.example.php';
+    if (is_array($exampleConfig) && array_key_exists('site_version', $exampleConfig)) {
+        $exampleVersion = trim((string)($exampleConfig['site_version'] ?? ''));
+    }
+}
+
 $config = [
     'app_name' => '思源笔记分享',
+    'site_version' => '',
     'db_path' => __DIR__ . '/storage/app.db',
     'uploads_dir' => __DIR__ . '/uploads',
     'allow_registration' => true,
@@ -11,6 +20,8 @@ $config = [
     'chunk_ttl_seconds' => 7200,
     'chunk_cleanup_probability' => 0.05,
     'chunk_cleanup_limit' => 20,
+    'min_chunk_size_kb' => 256,
+    'max_chunk_size_mb' => 8,
     'captcha_enabled' => true,
     'email_verification_enabled' => false,
     'email_from' => 'no-reply@example.com',
@@ -30,6 +41,9 @@ if (file_exists(__DIR__ . '/config.php')) {
     if (is_array($local)) {
         $config = array_merge($config, $local);
     }
+}
+if ($exampleVersion !== null) {
+    $config['site_version'] = $exampleVersion;
 }
 
 $sessionDays = (int)($config['session_lifetime_days'] ?? 30);
@@ -119,6 +133,7 @@ function migrate(PDO $pdo): void {
         password_hash TEXT,
         expires_at INTEGER,
         access_count INTEGER NOT NULL DEFAULT 0,
+        visitor_limit INTEGER NOT NULL DEFAULT 0,
         size_bytes INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
@@ -166,6 +181,7 @@ function migrate(PDO $pdo): void {
         title TEXT,
         password_hash TEXT,
         expires_at INTEGER,
+        visitor_limit INTEGER NOT NULL DEFAULT 0,
         asset_manifest TEXT,
         status TEXT NOT NULL DEFAULT "pending",
         created_at TEXT NOT NULL,
@@ -220,6 +236,16 @@ function migrate(PDO $pdo): void {
     $pdo->exec('CREATE INDEX IF NOT EXISTS idx_share_access_user_time ON share_access_logs (user_id, created_at)');
     $pdo->exec('CREATE INDEX IF NOT EXISTS idx_share_access_share_time ON share_access_logs (share_id, created_at)');
     $pdo->exec('CREATE INDEX IF NOT EXISTS idx_share_access_visitor_time ON share_access_logs (visitor_id, created_at)');
+
+    $pdo->exec('CREATE TABLE IF NOT EXISTS share_visitors (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        share_id INTEGER NOT NULL,
+        visitor_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(share_id, visitor_id),
+        FOREIGN KEY(share_id) REFERENCES shares(id)
+    );');
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_share_visitors_share ON share_visitors (share_id)');
 
     $pdo->exec('CREATE TABLE IF NOT EXISTS share_access_geo_cache (
         ip TEXT PRIMARY KEY,
@@ -280,7 +306,9 @@ function migrate(PDO $pdo): void {
     ensure_column($pdo, 'shares', 'password_hash', 'TEXT');
     ensure_column($pdo, 'shares', 'expires_at', 'INTEGER');
     ensure_column($pdo, 'shares', 'access_count', 'INTEGER NOT NULL DEFAULT 0');
+    ensure_column($pdo, 'shares', 'visitor_limit', 'INTEGER NOT NULL DEFAULT 0');
     ensure_column($pdo, 'shares', 'size_bytes', 'INTEGER NOT NULL DEFAULT 0');
+    ensure_column($pdo, 'share_uploads', 'visitor_limit', 'INTEGER NOT NULL DEFAULT 0');
     ensure_column($pdo, 'share_docs', 'size_bytes', 'INTEGER NOT NULL DEFAULT 0');
     ensure_column($pdo, 'share_docs', 'sort_order', 'INTEGER NOT NULL DEFAULT 0');
     ensure_column($pdo, 'share_docs', 'parent_id', 'TEXT');
@@ -599,6 +627,16 @@ function parse_expires_at($raw): ?int {
     return $ts ? $ts : null;
 }
 
+function parse_visitor_limit($raw): ?int {
+    if ($raw === null || $raw === '' || $raw === false) {
+        return null;
+    }
+    if (is_numeric($raw)) {
+        return max(0, (int)$raw);
+    }
+    return null;
+}
+
 function extract_front_matter(string $markdown): array {
     $meta = [];
     $body = $markdown;
@@ -668,6 +706,7 @@ function render_share_stats(array $share): string {
     $count = (int)($share['access_count'] ?? 0);
     $created = format_share_datetime((string)($share['created_at'] ?? ''));
     $expiresAt = (int)($share['expires_at'] ?? 0);
+    $visitorLimit = (int)($share['visitor_limit'] ?? 0);
     $chips = [];
     $chips[] = ['label' => '访问次数', 'value' => $count . ' 次'];
     if ($created !== '') {
@@ -675,6 +714,9 @@ function render_share_stats(array $share): string {
     }
     if ($expiresAt > 0) {
         $chips[] = ['label' => '到期时间', 'value' => date('Y-m-d H:i', $expiresAt)];
+    }
+    if ($visitorLimit > 0) {
+        $chips[] = ['label' => '访客上限', 'value' => $visitorLimit . ' 人'];
     }
     if (empty($chips)) {
         return '';
@@ -784,6 +826,10 @@ function render_page(string $title, string $content, ?array $user = null, string
     $pageTitle = htmlspecialchars($title);
     $userName = $user ? htmlspecialchars($user['username']) : '';
     $layout = isset($options['layout']) ? (string)$options['layout'] : ($user ? 'app' : 'public');
+    $titleHtml = $pageTitle;
+    if (!empty($options['title_html'])) {
+        $titleHtml = (string)$options['title_html'];
+    }
     $layoutClass = 'layout-' . preg_replace('/[^a-z0-9_-]+/i', '', $layout);
     $includeMarkdown = !empty($options['markdown']);
     $navKey = (string)($options['nav'] ?? '');
@@ -862,7 +908,7 @@ function render_page(string $title, string $content, ?array $user = null, string
         echo "<header class='app-topbar'>";
         echo "<div class='topbar-left'>";
         echo "<button class='app-side-trigger' type='button' data-app-drawer-open aria-label='打开导航'><svg viewBox='0 0 24 24' aria-hidden='true'><path fill='currentColor' d='M4 6h16v2H4zM4 11h16v2H4zM4 16h16v2H4z'/></svg></button>";
-        echo "<div class='topbar-title'>{$pageTitle}</div>";
+        echo "<div class='topbar-title'>{$titleHtml}</div>";
         echo "</div>";
         echo "<div class='topbar-right'>";
         echo "<span class='user-pill'>{$userName}</span>";
@@ -1125,6 +1171,145 @@ function http_get_json(string $url): ?array {
         }
     }
     return null;
+}
+
+function min_chunk_size_bytes(): int {
+    global $config;
+    $kb = (int)($config['min_chunk_size_kb'] ?? 256);
+    if ($kb <= 0) {
+        $kb = 256;
+    }
+    return $kb * 1024;
+}
+
+function max_chunk_size_bytes(): int {
+    global $config;
+    $mb = (int)($config['max_chunk_size_mb'] ?? 8);
+    if ($mb <= 0) {
+        $mb = 8;
+    }
+    return $mb * 1024 * 1024;
+}
+
+function chunk_size_limits(): array {
+    $min = min_chunk_size_bytes();
+    $max = max_chunk_size_bytes();
+    if ($max < $min) {
+        $max = $min;
+    }
+    return [$min, $max];
+}
+
+function site_version(): string {
+    global $config;
+    return trim((string)($config['site_version'] ?? ''));
+}
+
+function fetch_latest_release_info(): ?array {
+    $cachePath = __DIR__ . '/storage/release_cache.json';
+    $ttl = 3600;
+    if (is_file($cachePath) && (time() - filemtime($cachePath) < $ttl)) {
+        $cached = json_decode((string)file_get_contents($cachePath), true);
+        if (is_array($cached)) {
+            return $cached;
+        }
+    }
+    $latest = [
+        'version' => '',
+        'url' => '',
+        'has_php_site' => false,
+        'fetched_at' => time(),
+    ];
+    $perPage = 30;
+    $page = 1;
+    while (true) {
+        $url = 'https://api.github.com/repos/b8l8u8e8/siyuan-plugin-share/releases?per_page=' . $perPage . '&page=' . $page;
+        $data = http_get_json($url);
+        if (!$data || !is_array($data)) {
+            if ($page === 1) {
+                return null;
+            }
+            break;
+        }
+        if (empty($data)) {
+            break;
+        }
+        $keys = array_keys($data);
+        if ($keys !== range(0, count($keys) - 1)) {
+            if ($page === 1) {
+                return null;
+            }
+            break;
+        }
+        foreach ($data as $release) {
+            if (!is_array($release)) {
+                continue;
+            }
+            $assets = is_array($release['assets'] ?? null) ? $release['assets'] : [];
+            $version = '';
+            $hasPhpSite = false;
+            foreach ($assets as $asset) {
+                $name = (string)($asset['name'] ?? '');
+                if ($name === '') {
+                    continue;
+                }
+                if (stripos($name, 'php-site') === false) {
+                    continue;
+                }
+                $hasPhpSite = true;
+                if (preg_match('/php-site-v(.+)\.zip/i', $name, $matches)) {
+                    $version = trim((string)($matches[1] ?? ''));
+                }
+                break;
+            }
+            if ($hasPhpSite) {
+                if ($version === '') {
+                    $version = trim((string)($release['tag_name'] ?? $release['name'] ?? ''));
+                }
+                $latest['version'] = $version;
+                $latest['url'] = (string)($release['html_url'] ?? '');
+                $latest['has_php_site'] = true;
+                $latest['fetched_at'] = time();
+                break 2;
+            }
+        }
+        if (count($data) < $perPage) {
+            break;
+        }
+        $page++;
+    }
+    try {
+        ensure_dir(dirname($cachePath));
+        file_put_contents($cachePath, json_encode($latest, JSON_UNESCAPED_SLASHES));
+    } catch (Throwable $e) {
+        // ignore cache failure
+    }
+    return $latest;
+}
+
+function site_update_info(): ?array {
+    $current = site_version();
+    $latest = fetch_latest_release_info();
+    if (!$latest || empty($latest['has_php_site']) || ($latest['version'] ?? '') === '') {
+        return null;
+    }
+    $latestVersion = trim((string)$latest['version']);
+    $currentVersion = trim((string)$current);
+    $latestComparable = ltrim($latestVersion, 'vV');
+    $currentComparable = ltrim($currentVersion, 'vV');
+    $isNewer = false;
+    if ($currentComparable === '') {
+        $isNewer = true;
+    } else {
+        $isNewer = version_compare($latestComparable, $currentComparable, '>');
+    }
+    if (!$isNewer) {
+        return null;
+    }
+    return [
+        'version' => $latestVersion,
+        'url' => (string)($latest['url'] ?? ''),
+    ];
 }
 
 function country_code_zh_map(): array {
@@ -2438,6 +2623,7 @@ function hard_delete_share(int $shareId): ?int {
     purge_share_assets($shareId);
     purge_share_chunks($shareId);
     purge_share_access_logs($shareId);
+    $pdo->prepare('DELETE FROM share_visitors WHERE share_id = :share_id')->execute([':share_id' => $shareId]);
     $pdo->prepare('DELETE FROM share_docs WHERE share_id = :share_id')->execute([':share_id' => $shareId]);
     $pdo->prepare('DELETE FROM shares WHERE id = :id')->execute([':id' => $shareId]);
     recycle_share_id($shareId);
@@ -2626,10 +2812,14 @@ function handle_api(string $path): void {
     maybe_cleanup_chunks();
 
     if ($path === '/api/v1/auth/verify') {
+        [$minChunk, $maxChunk] = chunk_size_limits();
         api_response(200, ['user' => [
             'id' => $user['id'],
             'username' => $user['username'],
             'role' => $user['role'],
+        ], 'limits' => [
+            'minChunkSize' => $minChunk,
+            'maxChunkSize' => $maxChunk,
         ]]);
     }
 
@@ -2649,6 +2839,7 @@ function handle_api(string $path): void {
                 'createdAt' => strtotime($row['created_at']) * 1000,
                 'hasPassword' => !empty($row['password_hash']),
                 'expiresAt' => $row['expires_at'] ? ((int)$row['expires_at'] * 1000) : null,
+                'visitorLimit' => (int)($row['visitor_limit'] ?? 0),
                 'path' => '/s/' . $row['slug'],
                 'url' => share_url($row['slug']),
             ];
@@ -2705,9 +2896,12 @@ function handle_api(string $path): void {
         $clearPassword = !empty($payload['clearPassword']);
         $expiresAt = parse_expires_at($payload['expiresAt'] ?? null);
         $clearExpires = !empty($payload['clearExpires']);
+        $visitorLimit = parse_visitor_limit($payload['visitorLimit'] ?? null);
+        $clearVisitorLimit = !empty($payload['clearVisitorLimit']);
 
         $passwordHash = $share['password_hash'] ?? null;
         $expiresValue = isset($share['expires_at']) ? (int)$share['expires_at'] : null;
+        $visitorValue = isset($share['visitor_limit']) ? (int)$share['visitor_limit'] : 0;
         if ($clearPassword) {
             $passwordHash = null;
         } elseif ($password !== '') {
@@ -2718,21 +2912,31 @@ function handle_api(string $path): void {
         } elseif ($expiresAt !== null) {
             $expiresValue = $expiresAt;
         }
+        if ($clearVisitorLimit) {
+            $visitorValue = 0;
+        } elseif ($visitorLimit !== null) {
+            $visitorValue = $visitorLimit;
+        }
 
-        $stmt = $pdo->prepare('UPDATE shares SET password_hash = :password_hash, expires_at = :expires_at, updated_at = :updated_at WHERE id = :id AND user_id = :uid');
+        $stmt = $pdo->prepare('UPDATE shares SET password_hash = :password_hash, expires_at = :expires_at, visitor_limit = :visitor_limit, updated_at = :updated_at WHERE id = :id AND user_id = :uid');
         $stmt->execute([
             ':password_hash' => $passwordHash,
             ':expires_at' => $expiresValue,
+            ':visitor_limit' => $visitorValue,
             ':updated_at' => now(),
             ':id' => $shareId,
             ':uid' => $user['id'],
         ]);
+        if ($visitorValue > 0) {
+            seed_share_visitors_from_logs($shareId);
+        }
         api_response(200, ['share' => [
             'id' => (int)$share['id'],
             'slug' => $share['slug'],
             'url' => share_url($share['slug']),
             'hasPassword' => !empty($passwordHash),
             'expiresAt' => $expiresValue ? ($expiresValue * 1000) : null,
+            'visitorLimit' => $visitorValue,
         ]]);
     }
 
@@ -2751,6 +2955,8 @@ function handle_api(string $path): void {
         $clearPassword = !empty($meta['clearPassword']);
         $expiresAt = parse_expires_at($meta['expiresAt'] ?? null);
         $clearExpires = !empty($meta['clearExpires']);
+        $visitorLimit = parse_visitor_limit($meta['visitorLimit'] ?? null);
+        $clearVisitorLimit = !empty($meta['clearVisitorLimit']);
         if ($docId === '' || $markdown === '') {
             api_response(400, null, 'Missing document content');
         }
@@ -2782,6 +2988,7 @@ function handle_api(string $path): void {
 
         $passwordHash = $existing['password_hash'] ?? null;
         $expiresValue = isset($existing['expires_at']) ? (int)$existing['expires_at'] : null;
+        $visitorValue = isset($existing['visitor_limit']) ? (int)$existing['visitor_limit'] : 0;
         if ($clearPassword) {
             $passwordHash = null;
         } elseif ($password !== '') {
@@ -2791,6 +2998,11 @@ function handle_api(string $path): void {
             $expiresValue = null;
         } elseif ($expiresAt !== null) {
             $expiresValue = $expiresAt;
+        }
+        if ($clearVisitorLimit) {
+            $visitorValue = 0;
+        } elseif ($visitorLimit !== null) {
+            $visitorValue = $visitorLimit;
         }
 
         $finalSlug = $slug;
@@ -2826,8 +3038,8 @@ function handle_api(string $path): void {
 
         $finalTitle = $title ?: ($existing['title'] ?? $docId);
         $uploadId = generate_upload_id();
-        $stmt = $pdo->prepare('INSERT INTO share_uploads (upload_id, user_id, share_id, type, doc_id, slug, title, password_hash, expires_at, asset_manifest, status, created_at, updated_at)
-            VALUES (:upload_id, :user_id, :share_id, "doc", :doc_id, :slug, :title, :password_hash, :expires_at, :asset_manifest, "pending", :created_at, :updated_at)');
+        $stmt = $pdo->prepare('INSERT INTO share_uploads (upload_id, user_id, share_id, type, doc_id, slug, title, password_hash, expires_at, visitor_limit, asset_manifest, status, created_at, updated_at)
+            VALUES (:upload_id, :user_id, :share_id, "doc", :doc_id, :slug, :title, :password_hash, :expires_at, :visitor_limit, :asset_manifest, "pending", :created_at, :updated_at)');
         $stmt->execute([
             ':upload_id' => $uploadId,
             ':user_id' => $user['id'],
@@ -2837,6 +3049,7 @@ function handle_api(string $path): void {
             ':title' => $finalTitle,
             ':password_hash' => $passwordHash,
             ':expires_at' => $expiresValue,
+            ':visitor_limit' => $visitorValue,
             ':asset_manifest' => json_encode($assets, JSON_UNESCAPED_SLASHES),
             ':created_at' => now(),
             ':updated_at' => now(),
@@ -2872,6 +3085,8 @@ function handle_api(string $path): void {
         $clearPassword = !empty($meta['clearPassword']);
         $expiresAt = parse_expires_at($meta['expiresAt'] ?? null);
         $clearExpires = !empty($meta['clearExpires']);
+        $visitorLimit = parse_visitor_limit($meta['visitorLimit'] ?? null);
+        $clearVisitorLimit = !empty($meta['clearVisitorLimit']);
         if ($notebookId === '' || !is_array($docs) || count($docs) === 0) {
             api_response(400, null, 'Missing notebook or documents');
         }
@@ -2938,6 +3153,7 @@ function handle_api(string $path): void {
 
         $passwordHash = $existing['password_hash'] ?? null;
         $expiresValue = isset($existing['expires_at']) ? (int)$existing['expires_at'] : null;
+        $visitorValue = isset($existing['visitor_limit']) ? (int)$existing['visitor_limit'] : 0;
         if ($clearPassword) {
             $passwordHash = null;
         } elseif ($password !== '') {
@@ -2947,6 +3163,11 @@ function handle_api(string $path): void {
             $expiresValue = null;
         } elseif ($expiresAt !== null) {
             $expiresValue = $expiresAt;
+        }
+        if ($clearVisitorLimit) {
+            $visitorValue = 0;
+        } elseif ($visitorLimit !== null) {
+            $visitorValue = $visitorLimit;
         }
 
         $finalSlug = $slug;
@@ -2982,8 +3203,8 @@ function handle_api(string $path): void {
 
         $finalTitle = $title ?: ($existing['title'] ?? $notebookId);
         $uploadId = generate_upload_id();
-        $stmt = $pdo->prepare('INSERT INTO share_uploads (upload_id, user_id, share_id, type, notebook_id, slug, title, password_hash, expires_at, asset_manifest, status, created_at, updated_at)
-            VALUES (:upload_id, :user_id, :share_id, "notebook", :notebook_id, :slug, :title, :password_hash, :expires_at, :asset_manifest, "pending", :created_at, :updated_at)');
+        $stmt = $pdo->prepare('INSERT INTO share_uploads (upload_id, user_id, share_id, type, notebook_id, slug, title, password_hash, expires_at, visitor_limit, asset_manifest, status, created_at, updated_at)
+            VALUES (:upload_id, :user_id, :share_id, "notebook", :notebook_id, :slug, :title, :password_hash, :expires_at, :visitor_limit, :asset_manifest, "pending", :created_at, :updated_at)');
         $stmt->execute([
             ':upload_id' => $uploadId,
             ':user_id' => $user['id'],
@@ -2993,6 +3214,7 @@ function handle_api(string $path): void {
             ':title' => $finalTitle,
             ':password_hash' => $passwordHash,
             ':expires_at' => $expiresValue,
+            ':visitor_limit' => $visitorValue,
             ':asset_manifest' => json_encode($assets, JSON_UNESCAPED_SLASHES),
             ':created_at' => now(),
             ':updated_at' => now(),
@@ -3052,6 +3274,14 @@ function handle_api(string $path): void {
             api_response(400, null, 'Missing chunk file');
         }
         $file = $_FILES['chunk'];
+        $chunkSize = (int)($file['size'] ?? 0);
+        [$minChunk, $maxChunk] = chunk_size_limits();
+        if ($maxChunk > 0 && $chunkSize > $maxChunk) {
+            api_response(413, null, 'Chunk too large');
+        }
+        if ($minChunk > 0 && $chunkIndex < ($totalChunks - 1) && $chunkSize > 0 && $chunkSize < $minChunk) {
+            api_response(400, null, 'Chunk too small');
+        }
         $tmp = $file['tmp_name'] ?? '';
         if ($tmp === '' || !is_uploaded_file($tmp)) {
             api_response(400, null, 'Invalid chunk upload');
@@ -3201,6 +3431,7 @@ function handle_api(string $path): void {
         $title = trim((string)($upload['title'] ?? ''));
         $passwordHash = $upload['password_hash'] ?? null;
         $expiresValue = isset($upload['expires_at']) ? (int)$upload['expires_at'] : null;
+        $visitorValue = isset($upload['visitor_limit']) ? (int)$upload['visitor_limit'] : 0;
         $type = (string)($upload['type'] ?? 'doc');
         $docId = trim((string)($upload['doc_id'] ?? ''));
         $notebookId = trim((string)($upload['notebook_id'] ?? ''));
@@ -3208,12 +3439,13 @@ function handle_api(string $path): void {
         $pdo->beginTransaction();
         try {
             if ($share) {
-                $update = $pdo->prepare('UPDATE shares SET title = :title, slug = :slug, password_hash = :password_hash, expires_at = :expires_at, updated_at = :updated_at, deleted_at = NULL WHERE id = :id');
+                $update = $pdo->prepare('UPDATE shares SET title = :title, slug = :slug, password_hash = :password_hash, expires_at = :expires_at, visitor_limit = :visitor_limit, updated_at = :updated_at, deleted_at = NULL WHERE id = :id');
                 $update->execute([
                     ':title' => $title !== '' ? $title : ($share['title'] ?? $slug),
                     ':slug' => $slug,
                     ':password_hash' => $passwordHash,
                     ':expires_at' => $expiresValue,
+                    ':visitor_limit' => $visitorValue,
                     ':updated_at' => now(),
                     ':id' => $share['id'],
                 ]);
@@ -3224,8 +3456,8 @@ function handle_api(string $path): void {
             } else {
                 $shareId = allocate_share_id($pdo);
                 if ($shareId > 0) {
-                    $stmt = $pdo->prepare('INSERT INTO shares (id, user_id, type, slug, title, doc_id, notebook_id, password_hash, expires_at, created_at, updated_at)
-                        VALUES (:id, :uid, :type, :slug, :title, :doc_id, :notebook_id, :password_hash, :expires_at, :created_at, :updated_at)');
+                    $stmt = $pdo->prepare('INSERT INTO shares (id, user_id, type, slug, title, doc_id, notebook_id, password_hash, expires_at, visitor_limit, created_at, updated_at)
+                        VALUES (:id, :uid, :type, :slug, :title, :doc_id, :notebook_id, :password_hash, :expires_at, :visitor_limit, :created_at, :updated_at)');
                     $stmt->execute([
                         ':id' => $shareId,
                         ':uid' => $user['id'],
@@ -3236,12 +3468,13 @@ function handle_api(string $path): void {
                         ':notebook_id' => $type === 'notebook' ? $notebookId : null,
                         ':password_hash' => $passwordHash,
                         ':expires_at' => $expiresValue,
+                        ':visitor_limit' => $visitorValue,
                         ':created_at' => now(),
                         ':updated_at' => now(),
                     ]);
                 } else {
-                    $stmt = $pdo->prepare('INSERT INTO shares (user_id, type, slug, title, doc_id, notebook_id, password_hash, expires_at, created_at, updated_at)
-                        VALUES (:uid, :type, :slug, :title, :doc_id, :notebook_id, :password_hash, :expires_at, :created_at, :updated_at)');
+                    $stmt = $pdo->prepare('INSERT INTO shares (user_id, type, slug, title, doc_id, notebook_id, password_hash, expires_at, visitor_limit, created_at, updated_at)
+                        VALUES (:uid, :type, :slug, :title, :doc_id, :notebook_id, :password_hash, :expires_at, :visitor_limit, :created_at, :updated_at)');
                     $stmt->execute([
                         ':uid' => $user['id'],
                         ':type' => $type,
@@ -3251,6 +3484,7 @@ function handle_api(string $path): void {
                         ':notebook_id' => $type === 'notebook' ? $notebookId : null,
                         ':password_hash' => $passwordHash,
                         ':expires_at' => $expiresValue,
+                        ':visitor_limit' => $visitorValue,
                         ':created_at' => now(),
                         ':updated_at' => now(),
                     ]);
@@ -3315,6 +3549,9 @@ function handle_api(string $path): void {
             api_response(500, null, 'Upload finalize failed');
         }
 
+        if (!empty($visitorValue)) {
+            seed_share_visitors_from_logs($shareId);
+        }
         purge_upload_session_files($uploadId);
         recalculate_user_storage((int)$user['id']);
         api_response(200, [
@@ -3362,6 +3599,8 @@ function handle_api(string $path): void {
         $clearPassword = !empty($meta['clearPassword']);
         $expiresAt = parse_expires_at($meta['expiresAt'] ?? null);
         $clearExpires = !empty($meta['clearExpires']);
+        $visitorLimit = parse_visitor_limit($meta['visitorLimit'] ?? null);
+        $clearVisitorLimit = !empty($meta['clearVisitorLimit']);
         if ($docId === '' || $markdown === '') {
             api_response(400, null, '缺少文档内容');
         }
@@ -3400,6 +3639,7 @@ function handle_api(string $path): void {
 
         $passwordHash = $existing['password_hash'] ?? null;
         $expiresValue = isset($existing['expires_at']) ? (int)$existing['expires_at'] : null;
+        $visitorValue = isset($existing['visitor_limit']) ? (int)$existing['visitor_limit'] : 0;
         if ($clearPassword) {
             $passwordHash = null;
         } elseif ($password !== '') {
@@ -3409,6 +3649,11 @@ function handle_api(string $path): void {
             $expiresValue = null;
         } elseif ($expiresAt !== null) {
             $expiresValue = $expiresAt;
+        }
+        if ($clearVisitorLimit) {
+            $visitorValue = 0;
+        } elseif ($visitorLimit !== null) {
+            $visitorValue = $visitorLimit;
         }
 
         if ($existing) {
@@ -3420,12 +3665,13 @@ function handle_api(string $path): void {
                 }
             }
             $newSlug = $slug ?: $existing['slug'];
-            $stmt = $pdo->prepare('UPDATE shares SET title = :title, slug = :slug, password_hash = :password_hash, expires_at = :expires_at, updated_at = :updated_at, deleted_at = NULL WHERE id = :id');
+            $stmt = $pdo->prepare('UPDATE shares SET title = :title, slug = :slug, password_hash = :password_hash, expires_at = :expires_at, visitor_limit = :visitor_limit, updated_at = :updated_at, deleted_at = NULL WHERE id = :id');
             $stmt->execute([
                 ':title' => $title ?: $existing['title'],
                 ':slug' => $newSlug,
                 ':password_hash' => $passwordHash,
                 ':expires_at' => $expiresValue,
+                ':visitor_limit' => $visitorValue,
                 ':updated_at' => now(),
                 ':id' => $existing['id'],
             ]);
@@ -3450,8 +3696,8 @@ function handle_api(string $path): void {
             }
             $shareId = allocate_share_id($pdo);
             if ($shareId > 0) {
-                $stmt = $pdo->prepare('INSERT INTO shares (id, user_id, type, slug, title, doc_id, password_hash, expires_at, created_at, updated_at)
-                    VALUES (:id, :uid, "doc", :slug, :title, :doc_id, :password_hash, :expires_at, :created_at, :updated_at)');
+                $stmt = $pdo->prepare('INSERT INTO shares (id, user_id, type, slug, title, doc_id, password_hash, expires_at, visitor_limit, created_at, updated_at)
+                    VALUES (:id, :uid, "doc", :slug, :title, :doc_id, :password_hash, :expires_at, :visitor_limit, :created_at, :updated_at)');
                 $stmt->execute([
                     ':id' => $shareId,
                     ':uid' => $user['id'],
@@ -3460,12 +3706,13 @@ function handle_api(string $path): void {
                     ':doc_id' => $docId,
                     ':password_hash' => $passwordHash,
                     ':expires_at' => $expiresValue,
+                    ':visitor_limit' => $visitorValue,
                     ':created_at' => now(),
                     ':updated_at' => now(),
                 ]);
             } else {
-                $stmt = $pdo->prepare('INSERT INTO shares (user_id, type, slug, title, doc_id, password_hash, expires_at, created_at, updated_at)
-                    VALUES (:uid, "doc", :slug, :title, :doc_id, :password_hash, :expires_at, :created_at, :updated_at)');
+                $stmt = $pdo->prepare('INSERT INTO shares (user_id, type, slug, title, doc_id, password_hash, expires_at, visitor_limit, created_at, updated_at)
+                    VALUES (:uid, "doc", :slug, :title, :doc_id, :password_hash, :expires_at, :visitor_limit, :created_at, :updated_at)');
                 $stmt->execute([
                     ':uid' => $user['id'],
                     ':slug' => $slug,
@@ -3473,6 +3720,7 @@ function handle_api(string $path): void {
                     ':doc_id' => $docId,
                     ':password_hash' => $passwordHash,
                     ':expires_at' => $expiresValue,
+                    ':visitor_limit' => $visitorValue,
                     ':created_at' => now(),
                     ':updated_at' => now(),
                 ]);
@@ -3482,6 +3730,9 @@ function handle_api(string $path): void {
 
         if ($existing) {
             purge_share_assets($shareId);
+        }
+        if (!empty($visitorValue)) {
+            seed_share_visitors_from_logs($shareId);
         }
         $pdo->prepare('DELETE FROM share_docs WHERE share_id = :share_id')->execute([':share_id' => $shareId]);
         $stmt = $pdo->prepare('INSERT INTO share_docs (share_id, doc_id, title, hpath, parent_id, sort_index, markdown, sort_order, size_bytes, created_at, updated_at)
@@ -3533,6 +3784,8 @@ function handle_api(string $path): void {
         $clearPassword = !empty($meta['clearPassword']);
         $expiresAt = parse_expires_at($meta['expiresAt'] ?? null);
         $clearExpires = !empty($meta['clearExpires']);
+        $visitorLimit = parse_visitor_limit($meta['visitorLimit'] ?? null);
+        $clearVisitorLimit = !empty($meta['clearVisitorLimit']);
         if ($notebookId === '' || !is_array($docs) || count($docs) === 0) {
             api_response(400, null, '缺少笔记本 ID 或文档数据');
         }
@@ -3606,6 +3859,7 @@ function handle_api(string $path): void {
 
         $passwordHash = $existing['password_hash'] ?? null;
         $expiresValue = isset($existing['expires_at']) ? (int)$existing['expires_at'] : null;
+        $visitorValue = isset($existing['visitor_limit']) ? (int)$existing['visitor_limit'] : 0;
         if ($clearPassword) {
             $passwordHash = null;
         } elseif ($password !== '') {
@@ -3615,6 +3869,11 @@ function handle_api(string $path): void {
             $expiresValue = null;
         } elseif ($expiresAt !== null) {
             $expiresValue = $expiresAt;
+        }
+        if ($clearVisitorLimit) {
+            $visitorValue = 0;
+        } elseif ($visitorLimit !== null) {
+            $visitorValue = $visitorLimit;
         }
 
         if ($existing) {
@@ -3626,12 +3885,13 @@ function handle_api(string $path): void {
                 }
             }
             $newSlug = $slug ?: $existing['slug'];
-            $stmt = $pdo->prepare('UPDATE shares SET title = :title, slug = :slug, password_hash = :password_hash, expires_at = :expires_at, updated_at = :updated_at, deleted_at = NULL WHERE id = :id');
+            $stmt = $pdo->prepare('UPDATE shares SET title = :title, slug = :slug, password_hash = :password_hash, expires_at = :expires_at, visitor_limit = :visitor_limit, updated_at = :updated_at, deleted_at = NULL WHERE id = :id');
             $stmt->execute([
                 ':title' => $title ?: $existing['title'],
                 ':slug' => $newSlug,
                 ':password_hash' => $passwordHash,
                 ':expires_at' => $expiresValue,
+                ':visitor_limit' => $visitorValue,
                 ':updated_at' => now(),
                 ':id' => $existing['id'],
             ]);
@@ -3656,8 +3916,8 @@ function handle_api(string $path): void {
             }
             $shareId = allocate_share_id($pdo);
             if ($shareId > 0) {
-                $stmt = $pdo->prepare('INSERT INTO shares (id, user_id, type, slug, title, notebook_id, password_hash, expires_at, created_at, updated_at)
-                    VALUES (:id, :uid, "notebook", :slug, :title, :notebook_id, :password_hash, :expires_at, :created_at, :updated_at)');
+                $stmt = $pdo->prepare('INSERT INTO shares (id, user_id, type, slug, title, notebook_id, password_hash, expires_at, visitor_limit, created_at, updated_at)
+                    VALUES (:id, :uid, "notebook", :slug, :title, :notebook_id, :password_hash, :expires_at, :visitor_limit, :created_at, :updated_at)');
                 $stmt->execute([
                     ':id' => $shareId,
                     ':uid' => $user['id'],
@@ -3666,12 +3926,13 @@ function handle_api(string $path): void {
                     ':notebook_id' => $notebookId,
                     ':password_hash' => $passwordHash,
                     ':expires_at' => $expiresValue,
+                    ':visitor_limit' => $visitorValue,
                     ':created_at' => now(),
                     ':updated_at' => now(),
                 ]);
             } else {
-                $stmt = $pdo->prepare('INSERT INTO shares (user_id, type, slug, title, notebook_id, password_hash, expires_at, created_at, updated_at)
-                    VALUES (:uid, "notebook", :slug, :title, :notebook_id, :password_hash, :expires_at, :created_at, :updated_at)');
+                $stmt = $pdo->prepare('INSERT INTO shares (user_id, type, slug, title, notebook_id, password_hash, expires_at, visitor_limit, created_at, updated_at)
+                    VALUES (:uid, "notebook", :slug, :title, :notebook_id, :password_hash, :expires_at, :visitor_limit, :created_at, :updated_at)');
                 $stmt->execute([
                     ':uid' => $user['id'],
                     ':slug' => $slug,
@@ -3679,6 +3940,7 @@ function handle_api(string $path): void {
                     ':notebook_id' => $notebookId,
                     ':password_hash' => $passwordHash,
                     ':expires_at' => $expiresValue,
+                    ':visitor_limit' => $visitorValue,
                     ':created_at' => now(),
                     ':updated_at' => now(),
                 ]);
@@ -3688,6 +3950,9 @@ function handle_api(string $path): void {
 
         if ($existing) {
             purge_share_assets($shareId);
+        }
+        if (!empty($visitorValue)) {
+            seed_share_visitors_from_logs($shareId);
         }
         $pdo->prepare('DELETE FROM share_docs WHERE share_id = :share_id')->execute([':share_id' => $shareId]);
         $stmt = $pdo->prepare('INSERT INTO share_docs (share_id, doc_id, title, hpath, parent_id, sort_index, markdown, sort_order, size_bytes, created_at, updated_at)
@@ -3816,6 +4081,77 @@ function grant_share_access(int $shareId): void {
         $_SESSION['share_access'] = [];
     }
     $_SESSION['share_access'][$shareId] = true;
+}
+
+function share_visitor_limit(array $share): int {
+    return max(0, (int)($share['visitor_limit'] ?? 0));
+}
+
+function seed_share_visitors_from_logs(int $shareId): void {
+    if ($shareId <= 0) {
+        return;
+    }
+    $pdo = db();
+    $stmt = $pdo->prepare('SELECT COUNT(*) FROM share_visitors WHERE share_id = :sid');
+    $stmt->execute([':sid' => $shareId]);
+    if ((int)$stmt->fetchColumn() > 0) {
+        return;
+    }
+    $pdo->prepare('INSERT OR IGNORE INTO share_visitors (share_id, visitor_id, created_at)
+        SELECT share_id, visitor_id, MIN(created_at) FROM share_access_logs
+        WHERE share_id = :sid AND visitor_id IS NOT NULL AND visitor_id != ""
+        GROUP BY visitor_id')->execute([':sid' => $shareId]);
+}
+
+function share_visitor_count(int $shareId): int {
+    if ($shareId <= 0) {
+        return 0;
+    }
+    seed_share_visitors_from_logs($shareId);
+    $pdo = db();
+    $stmt = $pdo->prepare('SELECT COUNT(*) FROM share_visitors WHERE share_id = :sid');
+    $stmt->execute([':sid' => $shareId]);
+    return (int)$stmt->fetchColumn();
+}
+
+function share_visitor_limit_reached(array $share): bool {
+    $limit = share_visitor_limit($share);
+    if ($limit <= 0) {
+        return false;
+    }
+    $shareId = (int)($share['id'] ?? 0);
+    if ($shareId <= 0) {
+        return false;
+    }
+    seed_share_visitors_from_logs($shareId);
+    $visitorId = get_visitor_id();
+    $pdo = db();
+    if ($visitorId !== '') {
+        $stmt = $pdo->prepare('SELECT 1 FROM share_visitors WHERE share_id = :sid AND visitor_id = :vid LIMIT 1');
+        $stmt->execute([
+            ':sid' => $shareId,
+            ':vid' => $visitorId,
+        ]);
+        if ($stmt->fetchColumn()) {
+            return false;
+        }
+    }
+    $stmt = $pdo->prepare('SELECT COUNT(*) FROM share_visitors WHERE share_id = :sid');
+    $stmt->execute([':sid' => $shareId]);
+    return (int)$stmt->fetchColumn() >= $limit;
+}
+
+function register_share_visitor(int $shareId, string $visitorId): void {
+    if ($shareId <= 0 || $visitorId === '') {
+        return;
+    }
+    $pdo = db();
+    $pdo->prepare('INSERT OR IGNORE INTO share_visitors (share_id, visitor_id, created_at)
+        VALUES (:sid, :vid, :created_at)')->execute([
+        ':sid' => $shareId,
+        ':vid' => $visitorId,
+        ':created_at' => now(),
+    ]);
 }
 
 function build_doc_tree(array $docs, ?string $activeId = null): array {
@@ -4013,6 +4349,17 @@ function route_share(string $slug, ?string $docId = null): void {
         $content .= '<div class="share-empty">该分享已过期，内容不可见。</div>';
         $content .= '</div></div>';
         render_page($shareTitleRaw, $content, null, '', ['layout' => 'share']);
+        return;
+    }
+
+    if (share_visitor_limit_reached($share)) {
+        $content = '<div class="share-shell share-shell--single">';
+        $content .= '<div class="share-content">';
+        $content .= '<div class="share-header"><h1>' . $shareTitle . '</h1></div>';
+        $content .= '<div class="share-empty">访客数已达上限，分享已关闭。</div>';
+        $content .= '</div></div>';
+        render_page($shareTitleRaw, $content, null, '', ['layout' => 'share']);
+        return;
     }
 
     if (share_requires_password($share) && !share_access_granted($shareId)) {
@@ -4038,8 +4385,12 @@ function route_share(string $slug, ?string $docId = null): void {
         $content .= '<button class="button primary" type="submit">验证</button>';
         $content .= '</form></div></div></div>';
         render_page($shareTitleRaw, $content, null, '', ['layout' => 'share']);
+        return;
     }
 
+    if (share_visitor_limit($share) > 0) {
+        register_share_visitor($shareId, get_visitor_id());
+    }
     $pdo = db();
     $pdo->prepare('UPDATE shares SET access_count = access_count + 1 WHERE id = :id')
         ->execute([':id' => $shareId]);
@@ -5141,7 +5492,7 @@ if ($path === '/dashboard') {
     if (empty($shares)) {
         $content .= '<p class="muted" style="margin-top:12px">暂无分享记录。</p>';
     } else {
-        $content .= '<table class="table" style="margin-top:12px"><thead><tr><th>标题</th><th>类型</th><th>链接</th><th>密码</th><th>到期</th><th>状态</th><th>大小</th><th>更新时间</th></tr></thead><tbody>';
+        $content .= '<table class="table" style="margin-top:12px"><thead><tr><th>标题</th><th>类型</th><th>链接</th><th>密码</th><th>到期</th><th>访客上限</th><th>状态</th><th>大小</th><th>更新时间</th></tr></thead><tbody>';
         foreach ($shares as $share) {
             $title = htmlspecialchars($share['title']);
             $type = $share['type'] === 'notebook' ? '笔记本' : '文档';
@@ -5150,8 +5501,15 @@ if ($path === '/dashboard') {
             $size = format_bytes((int)($share['size_bytes'] ?? 0));
             $hasPassword = !empty($share['password_hash']) ? '已设置' : '无';
             $expiresAt = !empty($share['expires_at']) ? date('Y-m-d H:i', (int)$share['expires_at']) : '永久';
+            $visitorLimit = (int)($share['visitor_limit'] ?? 0);
+            if ($visitorLimit > 0) {
+                $visitorCount = share_visitor_count((int)$share['id']);
+                $visitorLabel = $visitorCount . '/' . $visitorLimit;
+            } else {
+                $visitorLabel = '不限';
+            }
             $status = $share['deleted_at'] ? '已删除' : '正常';
-            $content .= "<tr><td>{$title}</td><td>{$type}</td><td><a href=\"{$url}\" target=\"_blank\">{$url}</a></td><td>{$hasPassword}</td><td>{$expiresAt}</td><td>{$status}</td><td>{$size}</td><td>{$updated}</td></tr>";
+            $content .= "<tr><td>{$title}</td><td>{$type}</td><td><a href=\"{$url}\" target=\"_blank\">{$url}</a></td><td>{$hasPassword}</td><td>{$expiresAt}</td><td>{$visitorLabel}</td><td>{$status}</td><td>{$size}</td><td>{$updated}</td></tr>";
         }
         $content .= '</tbody></table>';
     }
@@ -5377,7 +5735,20 @@ if ($path === '/dashboard') {
         $content .= '</div>';
     }
 
-    render_page('控制台', $content, $user, '', ['layout' => 'app', 'nav' => 'dashboard']);
+    $versionText = site_version();
+    $versionHtml = '';
+    if ($versionText !== '') {
+        $versionLabel = $versionText;
+        if (stripos($versionLabel, 'v') !== 0) {
+            $versionLabel = 'v' . $versionLabel;
+        }
+        $versionHtml = '<span class="topbar-version">' . htmlspecialchars($versionLabel) . '</span>';
+    }
+    $titleHtml = htmlspecialchars('控制台');
+    if ($versionHtml !== '') {
+        $titleHtml .= ' ' . $versionHtml;
+    }
+    render_page('控制台', $content, $user, '', ['layout' => 'app', 'nav' => 'dashboard', 'title_html' => $titleHtml]);
 }
 
 if ($path === '/api-key/rotate' && $_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -5821,7 +6192,7 @@ if ($path === '/admin') {
     if (empty($shares)) {
         $content .= '<p class="muted" style="margin-top:12px">暂无分享记录。</p>';
     } else {
-        $content .= '<table class="table" style="margin-top:12px"><thead><tr><th><input type="checkbox" data-check-all="shares" form="share-batch-form"></th><th>标题</th><th>链接</th><th>类型</th><th>用户</th><th>密码</th><th>到期</th><th>状态</th><th>大小</th><th>更新时间</th><th>操作</th></tr></thead><tbody>';
+        $content .= '<table class="table" style="margin-top:12px"><thead><tr><th><input type="checkbox" data-check-all="shares" form="share-batch-form"></th><th>标题</th><th>链接</th><th>类型</th><th>用户</th><th>密码</th><th>到期</th><th>访客上限</th><th>状态</th><th>大小</th><th>更新时间</th><th>操作</th></tr></thead><tbody>';
         foreach ($shares as $share) {
             $type = $share['type'] === 'notebook' ? '笔记本' : '文档';
             $status = $share['deleted_at'] ? '已删除' : '正常';
@@ -5829,6 +6200,13 @@ if ($path === '/admin') {
             $url = share_url((string)$share['slug']);
             $hasPassword = !empty($share['password_hash']) ? '有密码' : '无密码';
             $expiresAt = !empty($share['expires_at']) ? date('Y-m-d H:i', (int)$share['expires_at']) : '永久';
+            $visitorLimit = (int)($share['visitor_limit'] ?? 0);
+            if ($visitorLimit > 0) {
+                $visitorCount = share_visitor_count((int)$share['id']);
+                $visitorLabel = $visitorCount . '/' . $visitorLimit;
+            } else {
+                $visitorLabel = '不限';
+            }
             $content .= '<tr>';
             $content .= '<td><input type="checkbox" name="share_ids[]" value="' . (int)$share['id'] . '" data-check-item="shares" form="share-batch-form"></td>';
             $content .= '<td>' . htmlspecialchars($share['title']) . '</td>';
@@ -5837,6 +6215,7 @@ if ($path === '/admin') {
             $content .= '<td>' . htmlspecialchars($share['username'] ?? '') . '</td>';
             $content .= '<td>' . htmlspecialchars($hasPassword) . '</td>';
             $content .= '<td>' . htmlspecialchars($expiresAt) . '</td>';
+            $content .= '<td>' . htmlspecialchars($visitorLabel) . '</td>';
             $content .= '<td>' . htmlspecialchars($status) . '</td>';
             $content .= '<td>' . htmlspecialchars($size) . '</td>';
             $content .= '<td>' . htmlspecialchars($share['updated_at']) . '</td>';
@@ -6053,7 +6432,38 @@ if ($path === '/admin') {
     $content .= '</form>';
     $content .= '</div>';
     $content .= '</div>';
-    render_page('后台', $content, $admin, '', ['layout' => 'app', 'nav' => 'admin-settings']);
+    $versionText = site_version();
+    $versionHtml = '';
+    if ($versionText !== '') {
+        $versionLabel = $versionText;
+        if (stripos($versionLabel, 'v') !== 0) {
+            $versionLabel = 'v' . $versionLabel;
+        }
+        $versionHtml = '<span class="topbar-version">' . htmlspecialchars($versionLabel) . '</span>';
+    }
+    $update = site_update_info();
+    $updateHtml = '';
+    if ($update) {
+        $updateVersion = trim((string)($update['version'] ?? ''));
+        if ($updateVersion !== '' && stripos($updateVersion, 'v') !== 0) {
+            $updateVersion = 'v' . $updateVersion;
+        }
+        $updateLabel = htmlspecialchars('有新版 ' . $updateVersion);
+        $updateUrl = trim((string)($update['url'] ?? ''));
+        if ($updateUrl !== '') {
+            $updateHtml = '<a class="topbar-version is-update" href="' . htmlspecialchars($updateUrl) . '" target="_blank" rel="noopener noreferrer">' . $updateLabel . '</a>';
+        } else {
+            $updateHtml = '<span class="topbar-version is-update">' . $updateLabel . '</span>';
+        }
+    }
+    $titleHtml = htmlspecialchars('后台');
+    if ($versionHtml !== '') {
+        $titleHtml .= ' ' . $versionHtml;
+    }
+    if ($updateHtml !== '') {
+        $titleHtml .= ' ' . $updateHtml;
+    }
+    render_page('后台', $content, $admin, '', ['layout' => 'app', 'nav' => 'admin-settings', 'title_html' => $titleHtml]);
 }
 
 if ($path === '/admin/settings' && $_SERVER['REQUEST_METHOD'] === 'POST') {

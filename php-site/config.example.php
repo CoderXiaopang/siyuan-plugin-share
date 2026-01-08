@@ -1,6 +1,8 @@
-﻿<?php
+<?php
 return [
     'app_name' => '思源笔记分享',
+    // Site version shown in dashboard header, e.g. "0.2.2"
+    'site_version' => '0.2.2',
     'allow_registration' => true,
     'default_storage_limit_mb' => 1024,
     // Session lifetime (days)
@@ -9,6 +11,9 @@ return [
     'chunk_ttl_seconds' => 7200,
     'chunk_cleanup_probability' => 0.05,
     'chunk_cleanup_limit' => 20,
+    // Upload chunk size limits (plugin will adapt to these values)
+    'min_chunk_size_kb' => 256,
+    'max_chunk_size_mb' => 8,
     'captcha_enabled' => true,
     'email_verification_enabled' => false,
     'email_from' => 'no-reply@example.com',

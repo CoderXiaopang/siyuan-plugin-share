@@ -1,85 +1,158 @@
 # 🔗 Siyuan Share
 
-This is a free sharing plugin for SiYuan Note. It supports generating share links for notebooks or documents, setting access passwords and expiration dates, and viewing share access statistics.
+**Siyuan Share** is a **free and open-source** plugin for **Siyuan Note** that allows you to generate **publicly accessible share links** for **entire notebooks or individual documents**.  
+It supports **access passwords, expiration time, visitor limits**, and provides **access statistics**, making it ideal for knowledge sharing, collaboration, and temporary public publishing.
 
-[中文](https://github.com/b8l8u8e8/siyuan-plugin-share/blob/main/README_zh_CN.md) | [English](https://github.com/b8l8u8e8/siyuan-plugin-share/blob/main/README.md)
+🌍 Documentation Languages:  
+[中文 README](https://github.com/b8l8u8e8/siyuan-plugin-share/blob/main/README_zh_CN.md) ｜ [English README](https://github.com/b8l8u8e8/siyuan-plugin-share/blob/main/README.md)
 
-## ✨ Usage
+---
 
-- **Access**: Right-click on a notebook or document in the document tree to enter the plugin menu. The menu includes the following functions:
-    - Create Share
-    - Update Share
-    - Copy Share Link
-    - Delete Share
-- **Share Management**: Go to the plugin settings page to view the list of all generated shares and manage them centrally.
+## ✨ How to Use
 
-## ⚠️ Notes
+### 📌 Entry Point
 
-- **Update Mechanism**: If you modify the content of a document or notebook, please use the **"Update Share"** function. This keeps the original share link unchanged while syncing the latest content.
-- **Link Changes**: If you select "Delete Share" and then "Create Share" again, the system will generate a new share link, and the old link will become invalid.
+In the **document tree**, right-click on a **notebook or document** → open the **plugin menu**, where you can:
 
-## ⚙️ Configuration
+- 🆕 Create Share / Manage Share  
+- 🔄 Update Share  
+- 📋 Copy Share Link  
+- 🗑️ Delete Share  
 
-This plugin relies on the server-side website [share.b0x.top](https://share.b0x.top) for data transmission.
+### 🗂️ Share Management
 
-1.  **Configuration Steps**:
-    - Please go to the website and register an account.
-    - Generate an **API Key** on the website.
-    - Enter the API Key into the plugin settings to complete the connection between the plugin and the server.
-    - Once configured, the share operation uploads the corresponding document/notebook to the server.
+Open the **plugin settings page** to view and manage **all created shares** in one place.
 
-2.  **Server Details**:
-    - Currently, [share.b0x.top](https://share.b0x.top) is a **public** server provided by the author, intended for functional demonstration and short-term use only.
-    - **Cleanup Policy**: Due to limits on server bandwidth and storage costs, the system implements a periodic cleanup policy for large files.
-    - **Self-hosting Recommendation**: For users with long-term persistent storage needs, it is strongly recommended to refer to the **[Server Deployment Tutorial](https://ccnwc9xa9692.feishu.cn/wiki/MQCtwMtQaifPuak4zl3cIMCqnLx)** for self-hosting.
+---
 
-## 📖 Demos
+## 🔐 Access Settings
 
-### 1. Generate and Enter API Key
+- **Access Password**  
+  Set a password for the share. Visitors must enter the correct password to view the content.
 
-![Generate and Enter API Key](https://github.com/user-attachments/assets/40bb0a47-d3f5-48fc-a96b-acd46fc6287d)
+- **Expiration Time**  
+  After the expiration time, the share will be marked as **expired** and become inaccessible.
 
-### 2. Share Document
+  > ⚠️ Cloud data is **not automatically deleted**. You can manually clean it up to save storage space.
 
-![Share Document](https://github.com/user-attachments/assets/82a5be6a-9a3e-4153-92a5-85e180c12d0e)
+- **Visitor Limit**  
+  Set the maximum number of visitors.
 
-### 3. Open Shared Document
+  - New visitors will be blocked once the limit is reached  
+  - Existing visitors can continue to access  
+  - Multiple visits from the same browser count as **one visitor**
 
-![Open Shared Document](https://github.com/user-attachments/assets/ba14f2b1-2bd0-4dfb-a32a-04ad1e7b5567)
+---
 
-### 4. Access Statistics
+## ⚠️ Notes & Best Practices
 
-<img width="1866" height="750" alt="Access Statistics" src="https://github.com/user-attachments/assets/b2690a03-6e97-4845-87be-1ab3e5406847" />
+- **Content Update Mechanism**
+  - If you **modify the document or notebook content**, use **“Update Share”**  
+    → Keeps the same share link while syncing the latest content
+  - If you only **change access settings** (password / expiration, etc.), use **“Update Access Settings”**  
+    → No need to re-upload content, saving time and bandwidth
+
+- **Link Change Rules**
+  If you **delete a share and then create a new one**,  
+  👉 A **new share link** will be generated and the old link will become invalid immediately.
+
+---
+
+## ⚙️ Plugin Configuration
+
+This plugin relies on a server-side service:  
+🌐 **[share.b0x.top](https://share.b0x.top)** (used for data storage and access)
+
+### 1️⃣ Configuration Steps
+
+1. Register an account on the server website  
+2. Generate an **API Key** on the website  
+3. Enter the API Key in the plugin settings  
+4. After configuration, you can start sharing  
+
+   > Sharing essentially uploads the selected document or notebook to the server
+
+### 2️⃣ Server Notes
+
+- **Public Service Disclaimer**  
+  The current `share.b0x.top` is a **public server provided by the author**,  
+  mainly for **feature testing and short-term use**.
+
+- **Data Cleanup Policy**  
+  Due to bandwidth and storage limitations,  
+  **large documents or notebooks may be cleaned up** periodically.
+
+- **Private Deployment (Strongly Recommended)**  
+  If you need **long-term sharing**,  
+  please refer to 👉 **[Server Deployment Guide](https://ccnwc9xa9692.feishu.cn/wiki/MQCtwMtQaifPuak4zl3cIMCqnLx)**  
+  to deploy your own private server.
+
+---
+
+## 📖 Feature Demo
+
+### ① Generate an API Key and configure the plugin
+
+![Generate API Key](https://github.com/user-attachments/assets/40bb0a47-d3f5-48fc-a96b-acd46fc6287d)
+
+---
+
+### ② Share a document or notebook
+
+![Share document](https://github.com/user-attachments/assets/82a5be6a-9a3e-4153-92a5-85e180c12d0e)
+
+---
+
+### ③ Open the share link to view content
+
+![Open shared document](https://github.com/user-attachments/assets/ba14f2b1-2bd0-4dfb-a32a-04ad1e7b5567)
+
+---
+
+### ④ Access statistics overview
+
+![Access statistics](https://github.com/user-attachments/assets/b2690a03-6e97-4845-87be-1ab3e5406847)
+
+---
 
 ## ☕ Support the Author
 
-If you find this project helpful, your support is welcome! This will encourage me to continue updates and build better tools ~
+If you find this project helpful, feel free to support the author ❤️  
+Your support motivates me to **continue maintaining and improving** the plugin.
 
 <div align="center">
     <a href="https://github.com/b8l8u8e8/siyuan-plugin-share">
-        <img src="https://img.shields.io/github/stars/b8l8u8e8/siyuan-plugin-share?style=for-the-badge&color=ffd700&label=Star%20Me" alt="Github Star">
+        <img src="https://img.shields.io/github/stars/b8l8u8e8/siyuan-plugin-share?style=for-the-badge&color=ffd700&label=⭐%20Star%20Support" alt="Github Star">
     </a>
 </div>
+
 <div align="center" style="margin-top: 40px;">
     <div style="display: flex; justify-content: center; align-items: center; gap: 30px;">
         <div style="text-align: center;">
             <img src="https://github.com/user-attachments/assets/81d0a064-b760-4e97-9c9b-bf83f6cafc8a" 
-                 style="height: 280px; width: auto; border-radius: 10px; border: 2px solid #07c160; object-fit: contain; display: inline-block;">
+                 style="height: 280px; width: auto; border-radius: 10px; border: 2px solid #07c160;">
             <br/>
-            <b style="color: #07c160; display: block; margin-top: 10px;">WeChat Pay</b>
+            <b style="color: #07c160; margin-top: 10px; display: block;">WeChat Pay</b>
         </div>
         <div style="text-align: center;">
             <img src="https://github.com/user-attachments/assets/9e1988d0-4016-4b8d-9ea6-ce8ff714ee17" 
-                 style="height: 280px; width: auto; border-radius: 10px; border: 2px solid #1677ff; object-fit: contain; display: inline-block;">
+                 style="height: 280px; width: auto; border-radius: 10px; border: 2px solid #1677ff;">
             <br/>
-            <b style="color: #1677ff; display: block; margin-top: 10px;">Alipay</b>
+            <b style="color: #1677ff; margin-top: 10px; display: block;">Alipay</b>
         </div>
     </div>
-    <p style="margin-top: 20px;"><i>Your support is my motivation for continuous iteration.</i></p>
+    <p style="margin-top: 20px;"><i>Your support is my greatest motivation to keep improving 🙏</i></p>
 </div>
 
-### 🛠️ More Info
+---
 
-- **Issues & Feedback**: [GitHub Issues](https://github.com/b8l8u8e8/siyuan-plugin-share/issues)
-- **License**: [MIT License](https://github.com/b8l8u8e8/siyuan-plugin-share/blob/main/LICENSE)
-- **Changelog**: [CHANGELOG.md](https://github.com/b8l8u8e8/siyuan-plugin-share/blob/main/CHANGELOG.md)
+## 🛠️ Additional Information
+
+- 🐞 Issue Tracking:  
+  [GitHub Issues](https://github.com/b8l8u8e8/siyuan-plugin-share/issues)
+
+- 📄 License:  
+  [MIT License](https://github.com/b8l8u8e8/siyuan-plugin-share/blob/main/LICENSE)
+
+- 🧾 Changelog:  
+  [CHANGELOG.md](https://github.com/b8l8u8e8/siyuan-plugin-share/blob/main/CHANGELOG.md)

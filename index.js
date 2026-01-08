@@ -23,7 +23,11 @@ try {
 const STORAGE_SETTINGS = "settings";
 const STORAGE_SHARES = "shares";
 const DOCK_TYPE = "siyuan-plugin-share-dock";
-const ASSET_CHUNK_SIZE = 2 * 1024 * 1024;
+const MB = 1024 * 1024;
+const UPLOAD_CHUNK_MIN_SIZE = 256 * 1024;
+const UPLOAD_CHUNK_MAX_SIZE = 8 * MB;
+const UPLOAD_TARGET_CHUNK_MS = 1800;
+const UPLOAD_DEFAULT_SPEED_BPS = 2 * MB;
 const DEFAULT_UPLOAD_ASSET_CONCURRENCY = 4;
 const DEFAULT_UPLOAD_CHUNK_CONCURRENCY = 4;
 
@@ -829,6 +833,8 @@ class SiYuanSharePlugin extends Plugin {
       uploadAssetConcurrency: DEFAULT_UPLOAD_ASSET_CONCURRENCY,
       uploadChunkConcurrency: DEFAULT_UPLOAD_CHUNK_CONCURRENCY,
     };
+    this.remoteUploadLimits = null;
+    this.uploadTuner = {avgSpeed: 0, samples: 0};
     this.shares = [];
     this.dockElement = null;
     this.workspaceDir = "";
@@ -1331,10 +1337,18 @@ class SiYuanSharePlugin extends Plugin {
     const hasPassword = !!share?.hasPassword;
     const expiresAt = normalizeTimestampMs(share?.expiresAt || 0);
     const expiresInputValue = expiresAt ? toDateTimeLocalInput(expiresAt) : "";
+    const visitorLimitValue = Number.isFinite(Number(share?.visitorLimit))
+      ? Math.max(0, Math.floor(Number(share.visitorLimit)))
+      : 0;
+    const visitorInputValue = visitorLimitValue > 0 ? String(visitorLimitValue) : "";
     const currentPasswordLabel = hasPassword
       ? t("siyuanShare.label.passwordSet")
       : t("siyuanShare.label.passwordNotSet");
     const currentExpiresLabel = expiresAt ? this.formatTime(expiresAt) : t("siyuanShare.label.expiresNotSet");
+    const currentVisitorLabel =
+      visitorLimitValue > 0
+        ? t("siyuanShare.label.visitorLimitCount", {count: visitorLimitValue})
+        : t("siyuanShare.label.visitorLimitNotSet");
     const passwordKeepToken = "__KEEP__";
     const passwordInputValue = share && hasPassword ? passwordKeepToken : "";
     const passwordPlaceholder = share
@@ -1362,11 +1376,14 @@ class SiYuanSharePlugin extends Plugin {
       <input id="sps-share-expires" type="datetime-local" step="60" class="b3-text-field" value="${escapeAttr(
         expiresInputValue,
       )}" />
+      <div class="siyuan-plugin-share__muted">${escapeHtml(t("siyuanShare.label.visitorLimit"))}</div>
+      <input id="sps-share-visitor-limit" type="number" min="0" step="1" class="b3-text-field" value="${escapeAttr(
+        visitorInputValue,
+      )}" placeholder="${escapeAttr(t("siyuanShare.hint.visitorLimit"))}" />
     </div>
-    <div class="siyuan-plugin-share__muted">${escapeHtml(t("siyuanShare.hint.keepOrClear"))}</div>
     <div class="siyuan-plugin-share__muted">${escapeHtml(
       currentPasswordLabel,
-    )} · ${escapeHtml(currentExpiresLabel)}</div>
+    )} | ${escapeHtml(currentExpiresLabel)} | ${escapeHtml(currentVisitorLabel)}</div>
   </div>
   <div class="siyuan-plugin-share__section">
     <div class="siyuan-plugin-share__title">${escapeHtml(t("siyuanShare.section.shareLink"))}</div>
@@ -1374,7 +1391,7 @@ class SiYuanSharePlugin extends Plugin {
       share
         ? `<div class="siyuan-plugin-share__muted">${escapeHtml(
             t("siyuanShare.label.shareId"),
-          )}：<span class="siyuan-plugin-share__mono">${escapeHtml(share.slug || "")}</span></div>
+          )}: <span class="siyuan-plugin-share__mono">${escapeHtml(share.slug || "")}</span></div>
       <div class="siyuan-plugin-share__actions" style="align-items: center;">
         <input class="b3-text-field fn__flex-1 siyuan-plugin-share__mono" readonly value="${escapeAttr(url)}" />
         <button class="b3-button b3-button--outline" data-action="copy" data-share-id="${escapeAttr(
@@ -1416,16 +1433,25 @@ class SiYuanSharePlugin extends Plugin {
     const readShareOptions = (root) => {
       const passwordInput = root?.querySelector?.("#sps-share-password");
       const expiresInput = root?.querySelector?.("#sps-share-expires");
+      const visitorInput = root?.querySelector?.("#sps-share-visitor-limit");
       const passwordRaw = (passwordInput?.value || "").trim();
       const expiresAt = parseDateTimeLocalInput(expiresInput?.value || "");
+      const visitorRaw = (visitorInput?.value || "").trim();
+      const visitorParsed = Number(visitorRaw);
+      const visitorLimit = Number.isFinite(visitorParsed)
+        ? Math.max(0, Math.floor(visitorParsed))
+        : null;
       const hasExistingPassword = !!share?.hasPassword;
       const hasExistingExpires = normalizeTimestampMs(share?.expiresAt || 0) > 0;
+      const hasExistingVisitorLimit = Number(share?.visitorLimit || 0) > 0;
       const password = passwordRaw === passwordKeepToken ? "" : passwordRaw;
       return {
         password,
         clearPassword: !!share && hasExistingPassword && passwordRaw === "",
         expiresAt,
         clearExpires: !!share && hasExistingExpires && !expiresAt,
+        visitorLimit,
+        clearVisitorLimit: !!share && hasExistingVisitorLimit && visitorRaw === "",
       };
     };
 
@@ -2184,6 +2210,11 @@ class SiYuanSharePlugin extends Plugin {
       ? t("siyuanShare.label.passwordSet")
       : t("siyuanShare.label.passwordNotSet");
     const expiresLabel = share?.expiresAt ? this.formatTime(share.expiresAt) : t("siyuanShare.label.expiresNotSet");
+    const visitorLimitValue = Number(share?.visitorLimit) || 0;
+    const visitorLabel =
+      visitorLimitValue > 0
+        ? t("siyuanShare.label.visitorLimitCount", {count: visitorLimitValue})
+        : t("siyuanShare.label.visitorLimitNotSet");
     wrap.innerHTML = `<div class="siyuan-plugin-share__section">
   <div class="siyuan-plugin-share__title">${escapeHtml(
     share ? t("siyuanShare.label.sharedDoc") : t("siyuanShare.label.unsharedDoc"),
@@ -2196,12 +2227,14 @@ class SiYuanSharePlugin extends Plugin {
     share
       ? `<div class="siyuan-plugin-share__muted">${escapeHtml(
           t("siyuanShare.label.shareId"),
-        )}：<span class="siyuan-plugin-share__mono">${escapeHtml(
+        )}: <span class="siyuan-plugin-share__mono">${escapeHtml(
           share.slug || "",
-        )}</span> · ${escapeHtml(t("siyuanShare.label.updatedAt"))}：${escapeHtml(
+        )}</span> | ${escapeHtml(t("siyuanShare.label.updatedAt"))}: ${escapeHtml(
           this.formatTime(share.updatedAt),
         )}</div>
-  <div class="siyuan-plugin-share__muted">${escapeHtml(passwordLabel)} · ${escapeHtml(expiresLabel)}</div>
+  <div class="siyuan-plugin-share__muted">${escapeHtml(
+          passwordLabel,
+        )} | ${escapeHtml(expiresLabel)} | ${escapeHtml(visitorLabel)}</div>
   <div class="siyuan-plugin-share__actions" style="align-items: center;">
     <input class="b3-text-field fn__flex-1 siyuan-plugin-share__mono" readonly value="${escapeAttr(url)}" />
     <button class="b3-button b3-button--outline" data-action="copy-link">${escapeHtml(
@@ -2239,6 +2272,11 @@ class SiYuanSharePlugin extends Plugin {
         const idLabel = s.type === SHARE_TYPES.NOTEBOOK ? s.notebookId : s.docId;
         const passwordLabel = s.hasPassword ? t("siyuanShare.label.passwordYes") : t("siyuanShare.label.passwordNo");
         const expiresLabel = s.expiresAt ? this.formatTime(s.expiresAt) : t("siyuanShare.label.expiresNotSet");
+        const visitorLimitValue = Number(s.visitorLimit) || 0;
+        const visitorLabel =
+          visitorLimitValue > 0
+            ? t("siyuanShare.label.visitorLimitCount", {count: visitorLimitValue})
+            : t("siyuanShare.label.visitorLimitNotSet");
         return `<div class="sps-share-item ${isCurrent ? "sps-share-item--current" : ""}">
   <div class="sps-share-item__main">
     <div class="sps-share-item__title" title="${escapeAttr(s.title || "")}">${escapeHtml(
@@ -2260,7 +2298,7 @@ class SiYuanSharePlugin extends Plugin {
           t("siyuanShare.label.accessSettings"),
         )}">${escapeHtml(
           passwordLabel,
-        )} · ${escapeHtml(expiresLabel)}</span>
+        )} | ${escapeHtml(expiresLabel)} | ${escapeHtml(visitorLabel)}</span>
       <span class="siyuan-plugin-share__muted siyuan-plugin-share__mono" title="${escapeAttr(
           t("siyuanShare.label.id"),
         )}">${escapeHtml(
@@ -2350,6 +2388,140 @@ class SiYuanSharePlugin extends Plugin {
     };
   }
 
+  normalizeUploadLimits(raw) {
+    if (!raw || typeof raw !== "object") return null;
+    const min = normalizePositiveInt(raw.minChunkSize, UPLOAD_CHUNK_MIN_SIZE);
+    const max = normalizePositiveInt(raw.maxChunkSize, UPLOAD_CHUNK_MAX_SIZE);
+    const safeMin = Math.max(1, Math.min(min, max));
+    const safeMax = Math.max(safeMin, max);
+    return {minChunkSize: safeMin, maxChunkSize: safeMax};
+  }
+
+  getUploadChunkLimits() {
+    const remote = this.remoteUploadLimits || {};
+    const min = normalizePositiveInt(remote.minChunkSize, UPLOAD_CHUNK_MIN_SIZE);
+    const max = normalizePositiveInt(remote.maxChunkSize, UPLOAD_CHUNK_MAX_SIZE);
+    const safeMin = Math.max(1, Math.min(min, max));
+    const safeMax = Math.max(safeMin, max);
+    return {min: safeMin, max: safeMax};
+  }
+
+  getUploadSpeedBps() {
+    const speed = this.uploadTuner?.avgSpeed;
+    if (Number.isFinite(speed) && speed > 0) return speed;
+    return UPLOAD_DEFAULT_SPEED_BPS;
+  }
+
+  updateUploadSpeed(bytes, ms) {
+    const size = Number(bytes);
+    const elapsed = Number(ms);
+    if (!Number.isFinite(size) || !Number.isFinite(elapsed) || size <= 0 || elapsed <= 0) return;
+    const speed = (size / elapsed) * 1000;
+    const tuner = this.uploadTuner || {avgSpeed: 0, samples: 0};
+    const alpha = 0.2;
+    tuner.avgSpeed = tuner.avgSpeed ? tuner.avgSpeed * (1 - alpha) + speed * alpha : speed;
+    tuner.samples = (tuner.samples || 0) + 1;
+    this.uploadTuner = tuner;
+  }
+
+  getAdaptiveAssetConcurrency(totalBytes, totalAssets, maxConcurrency) {
+    const limit = normalizePositiveInt(maxConcurrency, DEFAULT_UPLOAD_ASSET_CONCURRENCY);
+    const total = Math.max(1, Number(totalAssets) || 1);
+    if (total <= 1) return 1;
+    const size = Number(totalBytes);
+    const avgSize = Number.isFinite(size) && total > 0 ? size / total : 0;
+    const speed = this.getUploadSpeedBps();
+    let concurrency = 1;
+    if (total >= 20) {
+      concurrency = 4;
+    } else if (total >= 10) {
+      concurrency = 3;
+    } else if (total >= 4) {
+      concurrency = 2;
+    }
+    if (avgSize > 0) {
+      if (avgSize <= 512 * 1024) {
+        concurrency = Math.max(concurrency, 4);
+      } else if (avgSize <= 2 * MB) {
+        concurrency = Math.max(concurrency, 3);
+      } else if (avgSize <= 8 * MB) {
+        concurrency = Math.max(concurrency, 2);
+      }
+    }
+    if (speed >= 8 * MB) {
+      concurrency = Math.max(concurrency, 4);
+    } else if (speed >= 4 * MB) {
+      concurrency = Math.max(concurrency, 3);
+    } else if (speed >= 2 * MB) {
+      concurrency = Math.max(concurrency, 2);
+    }
+    if (avgSize >= 128 * MB) {
+      concurrency = Math.min(concurrency, 1);
+    } else if (avgSize >= 64 * MB) {
+      concurrency = Math.min(concurrency, 2);
+    }
+    return Math.min(limit, concurrency, total);
+  }
+
+  getAdaptiveChunkSize(sizeBytes) {
+    const size = Number(sizeBytes) || 0;
+    const {min, max} = this.getUploadChunkLimits();
+    if (size > 0 && size <= min) return size;
+    const speed = this.getUploadSpeedBps();
+    let chunkSize = Math.round((speed * UPLOAD_TARGET_CHUNK_MS) / 1000);
+    let sizeHint = 0;
+    if (size >= 1024 * MB) {
+      sizeHint = max;
+    } else if (size >= 512 * MB) {
+      sizeHint = Math.min(max, 6 * MB);
+    } else if (size >= 256 * MB) {
+      sizeHint = Math.min(max, 4 * MB);
+    } else if (size >= 128 * MB) {
+      sizeHint = Math.min(max, 3 * MB);
+    } else if (size >= 64 * MB) {
+      sizeHint = Math.min(max, 2 * MB);
+    } else if (size >= 16 * MB) {
+      sizeHint = Math.min(max, 1 * MB);
+    } else if (size >= 4 * MB) {
+      sizeHint = Math.min(max, Math.max(min, 512 * 1024));
+    }
+    chunkSize = Math.max(chunkSize, sizeHint);
+    chunkSize = Math.max(min, Math.min(max, chunkSize));
+    if (size > 0 && chunkSize > size) {
+      chunkSize = size;
+    }
+    return chunkSize;
+  }
+
+  getAdaptiveChunkConcurrency(sizeBytes, chunkSize, maxConcurrency) {
+    const size = Number(sizeBytes) || 0;
+    const chunk = Math.max(1, Number(chunkSize) || 1);
+    const totalChunks = Math.max(1, Math.ceil(size / chunk));
+    const limit = normalizePositiveInt(maxConcurrency, DEFAULT_UPLOAD_CHUNK_CONCURRENCY);
+    const speed = this.getUploadSpeedBps();
+    let concurrency = 1;
+    if (speed >= 10 * MB) {
+      concurrency = 4;
+    } else if (speed >= 6 * MB) {
+      concurrency = 3;
+    } else if (speed >= 2.5 * MB) {
+      concurrency = 2;
+    }
+    if (size >= 512 * MB) {
+      concurrency = Math.max(concurrency, 4);
+    } else if (size >= 256 * MB) {
+      concurrency = Math.max(concurrency, 3);
+    } else if (size >= 128 * MB) {
+      concurrency = Math.max(concurrency, 2);
+    }
+    if (totalChunks <= 2) {
+      concurrency = 1;
+    } else if (totalChunks <= 4) {
+      concurrency = Math.min(concurrency, 2);
+    }
+    return Math.min(limit, concurrency, totalChunks);
+  }
+
   formatUploadDetail(uploaded, total) {
     return this.t("siyuanShare.progress.uploadedBytes", {
       current: formatBytes(uploaded),
@@ -2365,7 +2537,8 @@ class SiYuanSharePlugin extends Plugin {
     if (!Array.isArray(entries) || entries.length === 0) return;
     const total = entries.length;
     const baseLabel = t("siyuanShare.progress.uploadingContent");
-    const {asset: assetConcurrency, chunk: chunkConcurrency} = this.getUploadConcurrency();
+    const {asset: assetMax, chunk: chunkMax} = this.getUploadConcurrency();
+    const assetConcurrency = this.getAdaptiveAssetConcurrency(totalBytes, entries.length, assetMax);
     const tracker =
       Number.isFinite(totalBytes) && totalBytes > 0
         ? {totalBytes, uploadedBytes: 0, label: baseLabel, started: false}
@@ -2388,16 +2561,7 @@ class SiYuanSharePlugin extends Plugin {
       } else {
         progress?.update?.(label);
       }
-      await this.uploadAssetInChunks(
-        uploadId,
-        asset,
-        docId,
-        controller,
-        progress,
-        tracker,
-        label,
-        chunkConcurrency,
-      );
+      await this.uploadAssetInChunks(uploadId, asset, docId, controller, progress, tracker, label, chunkMax);
     });
     await runTasksWithConcurrency(tasks, assetConcurrency);
     if (tracker) {
@@ -2417,16 +2581,16 @@ class SiYuanSharePlugin extends Plugin {
     progress,
     tracker,
     label,
-    chunkConcurrency,
+    chunkMaxConcurrency,
   ) {
     const t = this.t.bind(this);
     const blob = asset?.blob;
     const assetPath = asset?.path;
     if (!blob || !assetPath) return;
     const size = Number(blob.size) || 0;
-    const chunkSize = ASSET_CHUNK_SIZE;
+    const chunkSize = this.getAdaptiveChunkSize(size);
     const totalChunks = Math.max(1, Math.ceil(size / chunkSize));
-    const concurrency = normalizePositiveInt(chunkConcurrency, DEFAULT_UPLOAD_CHUNK_CONCURRENCY);
+    const concurrency = this.getAdaptiveChunkConcurrency(size, chunkSize, chunkMaxConcurrency);
     const uploadChunk = async (index) => {
       throwIfAborted(controller, t("siyuanShare.message.cancelled"));
       const start = index * chunkSize;
@@ -2440,6 +2604,7 @@ class SiYuanSharePlugin extends Plugin {
       form.append("totalChunks", String(totalChunks));
       form.append("totalSize", String(size));
       form.append("chunk", chunk, assetPath);
+      const startedAt = nowTs();
       await this.remoteRequest(REMOTE_API.shareAssetChunk, {
         method: "POST",
         body: form,
@@ -2447,6 +2612,8 @@ class SiYuanSharePlugin extends Plugin {
         controller,
         progress,
       });
+      const elapsed = nowTs() - startedAt;
+      this.updateUploadSpeed(end - start, elapsed);
       if (tracker && tracker.totalBytes > 0) {
         tracker.uploadedBytes += end - start;
         const percent = (tracker.uploadedBytes / tracker.totalBytes) * 100;
@@ -2479,6 +2646,8 @@ class SiYuanSharePlugin extends Plugin {
       clearPassword = false,
       expiresAt = null,
       clearExpires = false,
+      visitorLimit = null,
+      clearVisitorLimit = false,
       allowRequestError = true,
     } = {},
   ) {
@@ -2523,6 +2692,11 @@ class SiYuanSharePlugin extends Plugin {
         payload.clearExpires = true;
       } else if (Number.isFinite(expiresAt) && expiresAt > 0) {
         payload.expiresAt = expiresAt;
+      }
+      if (clearVisitorLimit) {
+        payload.clearVisitorLimit = true;
+      } else if (Number.isFinite(visitorLimit)) {
+        payload.visitorLimit = Math.max(0, Math.floor(visitorLimit));
       }
       const seenAssets = new Set();
       const assetEntries = [];
@@ -2615,6 +2789,8 @@ class SiYuanSharePlugin extends Plugin {
       clearPassword = false,
       expiresAt = null,
       clearExpires = false,
+      visitorLimit = null,
+      clearVisitorLimit = false,
       allowRequestError = true,
     } = {},
   ) {
@@ -2688,6 +2864,11 @@ class SiYuanSharePlugin extends Plugin {
         payload.clearExpires = true;
       } else if (Number.isFinite(expiresAt) && expiresAt > 0) {
         payload.expiresAt = expiresAt;
+      }
+      if (clearVisitorLimit) {
+        payload.clearVisitorLimit = true;
+      } else if (Number.isFinite(visitorLimit)) {
+        payload.visitorLimit = Math.max(0, Math.floor(visitorLimit));
       }
       const assetEntries = Array.from(assetMap.values());
       const assetManifest = assetEntries.map(({asset, docId}) => ({
@@ -2866,7 +3047,14 @@ class SiYuanSharePlugin extends Plugin {
 
   async updateShare(
     shareId,
-    {password = "", clearPassword = false, expiresAt = null, clearExpires = false} = {},
+    {
+      password = "",
+      clearPassword = false,
+      expiresAt = null,
+      clearExpires = false,
+      visitorLimit = null,
+      clearVisitorLimit = false,
+    } = {},
   ) {
     const t = this.t.bind(this);
     if (!shareId) throw new Error(t("siyuanShare.error.missingShareId"));
@@ -2879,6 +3067,8 @@ class SiYuanSharePlugin extends Plugin {
         clearPassword,
         expiresAt,
         clearExpires,
+        visitorLimit,
+        clearVisitorLimit,
         allowRequestError: false,
       });
       return;
@@ -2889,13 +3079,22 @@ class SiYuanSharePlugin extends Plugin {
       clearPassword,
       expiresAt,
       clearExpires,
+      visitorLimit,
+      clearVisitorLimit,
       allowRequestError: false,
     });
   }
 
   async updateShareAccess(
     shareId,
-    {password = "", clearPassword = false, expiresAt = null, clearExpires = false} = {},
+    {
+      password = "",
+      clearPassword = false,
+      expiresAt = null,
+      clearExpires = false,
+      visitorLimit = null,
+      clearVisitorLimit = false,
+    } = {},
   ) {
     const t = this.t.bind(this);
     if (!shareId) throw new Error(t("siyuanShare.error.missingShareId"));
@@ -2917,6 +3116,11 @@ class SiYuanSharePlugin extends Plugin {
         payload.clearExpires = true;
       } else if (Number.isFinite(expiresAt) && expiresAt > 0) {
         payload.expiresAt = expiresAt;
+      }
+      if (clearVisitorLimit) {
+        payload.clearVisitorLimit = true;
+      } else if (Number.isFinite(visitorLimit)) {
+        payload.visitorLimit = Math.max(0, Math.floor(visitorLimit));
       }
       progress.update(t("siyuanShare.progress.requesting"));
       await this.remoteRequest(REMOTE_API.shareAccessUpdate, {
@@ -3061,6 +3265,7 @@ class SiYuanSharePlugin extends Plugin {
       progress,
     });
     this.remoteUser = data?.user || null;
+    this.remoteUploadLimits = this.normalizeUploadLimits(data?.limits);
     this.remoteVerifiedAt = nowTs();
     this.syncSettingInputs();
     return data;
@@ -3215,6 +3420,11 @@ class SiYuanSharePlugin extends Plugin {
         const typeLabel =
           s.type === SHARE_TYPES.NOTEBOOK ? t("siyuanShare.label.notebook") : t("siyuanShare.label.document");
         const idLabel = s.type === SHARE_TYPES.NOTEBOOK ? s.notebookId : s.docId;
+        const visitorLimitValue = Number(s.visitorLimit) || 0;
+        const visitorLabel =
+          visitorLimitValue > 0
+            ? t("siyuanShare.label.visitorLimitCount", {count: visitorLimitValue})
+            : t("siyuanShare.label.visitorLimitNotSet");
         return `<tr>
   <td>
     <div>${escapeHtml(s.title || "")}</div>
@@ -3223,6 +3433,7 @@ class SiYuanSharePlugin extends Plugin {
   <td class="siyuan-plugin-share__mono">${escapeHtml(typeLabel)}</td>
   <td>
     <div class="siyuan-plugin-share__mono">${escapeHtml(url)}</div>
+    <div class="siyuan-plugin-share__muted">${escapeHtml(visitorLabel)}</div>
     <div class="siyuan-plugin-share__muted">${escapeHtml(this.formatTime(s.updatedAt))}</div>
   </td>
   <td>

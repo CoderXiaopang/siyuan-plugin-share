@@ -981,6 +981,22 @@ body.app-side-open {
   color: #2b3a6f;
 }
 
+.topbar-version {
+  margin-left: 8px;
+  font-size: 13px;
+  font-weight: 500;
+  color: #6674a5;
+}
+
+.topbar-version.is-update {
+  color: #c44f2b;
+  text-decoration: none;
+}
+
+.topbar-version.is-update:hover {
+  text-decoration: underline;
+}
+
 .topbar-right {
   display: flex;
   align-items: center;
