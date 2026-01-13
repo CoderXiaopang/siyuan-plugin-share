@@ -88,19 +88,19 @@
 
 ### ① 生成 API Key 并填入插件
 
-![生成 API Key 并填入](https://github.com/user-attachments/assets/40bb0a47-d3f5-48fc-a96b-acd46fc6287d)
+![生成 API Key 并填入](https://github.com/user-attachments/assets/8ad5e431-8a60-4e83-a594-ff1de28af68d)
 
 ---
 
 ### ② 分享文档 / 笔记本
 
-![分享文档](https://github.com/user-attachments/assets/82a5be6a-9a3e-4153-92a5-85e180c12d0e)
+![分享文档](https://github.com/user-attachments/assets/8bd33e72-4b09-43f3-8fe5-e81f9b39baf9)
 
 ---
 
 ### ③ 打开分享链接查看内容
 
-![打开分享文档](https://github.com/user-attachments/assets/ba14f2b1-2bd0-4dfb-a32a-04ad1e7b5567)
+![打开分享文档](https://github.com/user-attachments/assets/490f459c-caac-4859-860c-e00de4356706)
 
 ---
 
@@ -151,3 +151,4 @@
 
 - 🧾 更新日志：  
   [CHANGELOG.md](https://github.com/b8l8u8e8/siyuan-plugin-share/blob/main/CHANGELOG.md)
+
