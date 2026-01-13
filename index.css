@@ -42,6 +42,16 @@
   width: 100%;
 }
 
+.siyuan-plugin-share__grid .sps-site-select {
+  width: 100%;
+  min-width: 240px;
+}
+
+.sps-site-select--setting {
+  width: 240px;
+  max-width: 100%;
+}
+
 .siyuan-plugin-share__actions {
   display: flex;
   gap: 8px;

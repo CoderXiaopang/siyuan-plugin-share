@@ -22,14 +22,19 @@ try {
 
 const STORAGE_SETTINGS = "settings";
 const STORAGE_SHARES = "shares";
+const STORAGE_SITE_SHARES = "sharesBySite";
 const DOCK_TYPE = "siyuan-plugin-share-dock";
 const MB = 1024 * 1024;
 const UPLOAD_CHUNK_MIN_SIZE = 256 * 1024;
 const UPLOAD_CHUNK_MAX_SIZE = 8 * MB;
+const UPLOAD_CHUNK_HARD_MAX_SIZE = 10 * MB;
 const UPLOAD_TARGET_CHUNK_MS = 1800;
 const UPLOAD_DEFAULT_SPEED_BPS = 2 * MB;
-const DEFAULT_UPLOAD_ASSET_CONCURRENCY = 4;
+const DEFAULT_UPLOAD_ASSET_CONCURRENCY = 8;
 const DEFAULT_UPLOAD_CHUNK_CONCURRENCY = 4;
+const UPLOAD_RETRY_LIMIT = 2;
+const UPLOAD_RETRY_BASE_DELAY = 400;
+const UPLOAD_RETRY_MAX_DELAY = 2000;
 
 const REMOTE_API = {
   verify: "/api/v1/auth/verify",
@@ -105,6 +110,43 @@ async function runTasksWithConcurrency(tasks, concurrency) {
   await Promise.all(workers);
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isAbortError(err) {
+  return err?.name === "AbortError" || /cancelled/i.test(String(err?.message || ""));
+}
+
+async function withRetry(task, {retries = 0, baseDelay = 0, maxDelay = 0, controller = null, onRetry = null} = {}) {
+  let attempt = 0;
+  while (true) {
+    if (controller?.signal?.aborted) {
+      throw new Error(tGlobal("siyuanShare.message.cancelled"));
+    }
+    try {
+      return await task();
+    } catch (err) {
+      if (isAbortError(err) || attempt >= retries) {
+        throw err;
+      }
+      attempt += 1;
+      if (onRetry) {
+        try {
+          onRetry(attempt, err);
+        } catch {
+          // ignore
+        }
+      }
+      const delay = Math.min(maxDelay || baseDelay, baseDelay * Math.pow(2, attempt - 1));
+      const jitter = delay ? Math.floor(delay * (0.2 * Math.random())) : 0;
+      if (delay + jitter > 0) {
+        await sleep(delay + jitter);
+      }
+    }
+  }
+}
+
 function nowTs() {
   return Date.now();
 }
@@ -141,18 +183,79 @@ function parseDateTimeLocalInput(value) {
 
 function formatBytes(bytes) {
   const value = Number(bytes);
-  if (!Number.isFinite(value) || value <= 0) return "0 KB";
+  if (!Number.isFinite(value) || value <= 0) {
+    return tGlobal("siyuanShare.format.sizeKb", {value: "0"});
+  }
   const kb = value / 1024;
   if (kb < 1024) {
-    return `${kb < 10 ? kb.toFixed(1) : kb.toFixed(0)} KB`;
+    const display = kb < 10 ? kb.toFixed(1) : kb.toFixed(0);
+    return tGlobal("siyuanShare.format.sizeKb", {value: display});
   }
   const mb = kb / 1024;
-  return `${mb < 10 ? mb.toFixed(1) : mb.toFixed(0)} MB`;
+  const display = mb < 10 ? mb.toFixed(1) : mb.toFixed(0);
+  return tGlobal("siyuanShare.format.sizeMb", {value: display});
+}
+
+function getUrlHost(raw) {
+  try {
+    return new URL(String(raw || "")).host || "";
+  } catch {
+    return "";
+  }
+}
+
+function tryDecodeAssetPath(value) {
+  const raw = String(value || "");
+  if (!/%[0-9a-fA-F]{2}/.test(raw)) return "";
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return "";
+  }
+}
+
+function replaceAllText(input, search, replacement) {
+  if (!search) return input;
+  return String(input || "").split(search).join(replacement);
+}
+
+function appendAssetSuffix(path, index) {
+  const raw = String(path || "");
+  const slash = raw.lastIndexOf("/");
+  const dir = slash >= 0 ? raw.slice(0, slash + 1) : "";
+  const name = slash >= 0 ? raw.slice(slash + 1) : raw;
+  const dot = name.lastIndexOf(".");
+  if (dot > 0) {
+    return `${dir}${name.slice(0, dot)}-${index}${name.slice(dot)}`;
+  }
+  return `${dir}${name}-${index}`;
+}
+
+function ensureUniqueAssetPath(path, used) {
+  if (!path) return "";
+  const taken = used || new Set();
+  let candidate = path;
+  let index = 1;
+  while (taken.has(candidate)) {
+    candidate = appendAssetSuffix(path, index);
+    index += 1;
+  }
+  taken.add(candidate);
+  return candidate;
+}
+
+function sanitizeAssetUploadPath(path, used) {
+  const decoded = tryDecodeAssetPath(path) || "";
+  const raw = decoded || String(path || "");
+  const stripped = raw.replace(/\s+/g, "");
+  const normalized = normalizeAssetPath(stripped);
+  if (!normalized) return "";
+  return ensureUniqueAssetPath(normalized, used);
 }
 
 function throwIfAborted(controller, message) {
   if (controller?.signal?.aborted) {
-    throw new Error(message || "Operation cancelled.");
+    throw new Error(message || tGlobal("siyuanShare.message.cancelled"));
   }
 }
 
@@ -832,10 +935,13 @@ class SiYuanSharePlugin extends Plugin {
       apiKey: "",
       uploadAssetConcurrency: DEFAULT_UPLOAD_ASSET_CONCURRENCY,
       uploadChunkConcurrency: DEFAULT_UPLOAD_CHUNK_CONCURRENCY,
+      sites: [],
+      activeSiteId: "",
     };
     this.remoteUploadLimits = null;
     this.uploadTuner = {avgSpeed: 0, samples: 0};
     this.shares = [];
+    this.siteShares = {};
     this.dockElement = null;
     this.workspaceDir = "";
     this.hasNodeFs = !!(fs && path);
@@ -852,6 +958,8 @@ class SiYuanSharePlugin extends Plugin {
     this.settingEls = {
       siteInput: null,
       apiKeyInput: null,
+      siteSelect: null,
+      siteNameInput: null,
       currentWrap: null,
       sharesWrap: null,
       envHint: null,
@@ -907,6 +1015,7 @@ class SiYuanSharePlugin extends Plugin {
     setGlobalI18nProvider(null);
     if (this.dockElement) {
       this.dockElement.removeEventListener("click", this.onDockClick);
+      this.dockElement.removeEventListener("change", this.onDockChange);
     }
     this.eventBus.off("click-editortitleicon", this.onEditorTitleMenu);
     this.eventBus.off("open-menu-doctree", this.onDocTreeMenu);
@@ -950,6 +1059,7 @@ class SiYuanSharePlugin extends Plugin {
   async uninstall() {
     await this.removeData(STORAGE_SETTINGS);
     await this.removeData(STORAGE_SHARES);
+    await this.removeData(STORAGE_SITE_SHARES);
   }
 
   onSwitchProtyle = ({detail}) => {
@@ -1329,35 +1439,59 @@ class SiYuanSharePlugin extends Plugin {
       itemTitle = notebook?.name || itemTitle || t("siyuanShare.label.unknown");
     }
 
-    const share =
-      itemType === SHARE_TYPES.NOTEBOOK ? this.getShareByNotebookId(itemId) : this.getShareByDocId(itemId);
-    const url = share ? this.getShareUrl(share) : "";
     const typeLabel =
       itemType === SHARE_TYPES.NOTEBOOK ? t("siyuanShare.label.notebook") : t("siyuanShare.label.document");
-    const hasPassword = !!share?.hasPassword;
-    const expiresAt = normalizeTimestampMs(share?.expiresAt || 0);
-    const expiresInputValue = expiresAt ? toDateTimeLocalInput(expiresAt) : "";
-    const visitorLimitValue = Number.isFinite(Number(share?.visitorLimit))
-      ? Math.max(0, Math.floor(Number(share.visitorLimit)))
-      : 0;
-    const visitorInputValue = visitorLimitValue > 0 ? String(visitorLimitValue) : "";
-    const currentPasswordLabel = hasPassword
-      ? t("siyuanShare.label.passwordSet")
-      : t("siyuanShare.label.passwordNotSet");
-    const currentExpiresLabel = expiresAt ? this.formatTime(expiresAt) : t("siyuanShare.label.expiresNotSet");
-    const currentVisitorLabel =
-      visitorLimitValue > 0
-        ? t("siyuanShare.label.visitorLimitCount", {count: visitorLimitValue})
-        : t("siyuanShare.label.visitorLimitNotSet");
     const passwordKeepToken = "__KEEP__";
-    const passwordInputValue = share && hasPassword ? passwordKeepToken : "";
-    const passwordPlaceholder = share
-      ? (hasPassword ? t("siyuanShare.hint.passwordKeep") : t("siyuanShare.label.passwordNotSet"))
-      : t("siyuanShare.hint.passwordOptional");
+    const getShare = () =>
+      itemType === SHARE_TYPES.NOTEBOOK ? this.getShareByNotebookId(itemId) : this.getShareByDocId(itemId);
+    const buildViewState = () => {
+      const share = getShare();
+      const url = share ? this.getShareUrl(share) : "";
+      const hasPassword = !!share?.hasPassword;
+      const expiresAt = normalizeTimestampMs(share?.expiresAt || 0);
+      const expiresInputValue = expiresAt ? toDateTimeLocalInput(expiresAt) : "";
+      const visitorLimitValue = Number.isFinite(Number(share?.visitorLimit))
+        ? Math.max(0, Math.floor(Number(share.visitorLimit)))
+        : 0;
+      const visitorInputValue = visitorLimitValue > 0 ? String(visitorLimitValue) : "";
+      const currentPasswordLabel = hasPassword
+        ? t("siyuanShare.label.passwordSet")
+        : t("siyuanShare.label.passwordNotSet");
+      const currentExpiresLabel = expiresAt ? this.formatTime(expiresAt) : t("siyuanShare.label.expiresNotSet");
+      const currentVisitorLabel =
+        visitorLimitValue > 0
+          ? t("siyuanShare.label.visitorLimitCount", {count: visitorLimitValue})
+          : t("siyuanShare.label.visitorLimitNotSet");
+      const passwordInputValue = share && hasPassword ? passwordKeepToken : "";
+      const passwordPlaceholder = share
+        ? (hasPassword ? t("siyuanShare.hint.passwordKeep") : t("siyuanShare.label.passwordNotSet"))
+        : t("siyuanShare.hint.passwordOptional");
+      return {
+        share,
+        url,
+        expiresInputValue,
+        visitorLimitValue,
+        visitorInputValue,
+        currentPasswordLabel,
+        currentExpiresLabel,
+        currentVisitorLabel,
+        passwordInputValue,
+        passwordPlaceholder,
+      };
+    };
 
-
-
-    const content = `<div class="siyuan-plugin-share sps-dialog-body">
+    const renderContent = () => {
+      const state = buildViewState();
+      const share = state.share;
+      const url = state.url;
+      const expiresInputValue = state.expiresInputValue;
+      const visitorInputValue = state.visitorInputValue;
+      const currentPasswordLabel = state.currentPasswordLabel;
+      const currentExpiresLabel = state.currentExpiresLabel;
+      const currentVisitorLabel = state.currentVisitorLabel;
+      const passwordInputValue = state.passwordInputValue;
+      const passwordPlaceholder = state.passwordPlaceholder;
+      return `<div class="siyuan-plugin-share sps-dialog-body">
   <div class="siyuan-plugin-share__section">
     <div class="siyuan-plugin-share__title">${escapeHtml(typeLabel)}</div>
     <div>${escapeHtml(itemTitle)}</div>
@@ -1429,8 +1563,10 @@ class SiYuanSharePlugin extends Plugin {
     t("siyuanShare.action.openSettings"),
   )}</button>
 </div>`;
+    };
+    const content = `<div class="sps-share-dialog-content">${renderContent()}</div>`;
 
-    const readShareOptions = (root) => {
+    const readShareOptions = (root, currentShare) => {
       const passwordInput = root?.querySelector?.("#sps-share-password");
       const expiresInput = root?.querySelector?.("#sps-share-expires");
       const visitorInput = root?.querySelector?.("#sps-share-visitor-limit");
@@ -1441,17 +1577,17 @@ class SiYuanSharePlugin extends Plugin {
       const visitorLimit = Number.isFinite(visitorParsed)
         ? Math.max(0, Math.floor(visitorParsed))
         : null;
-      const hasExistingPassword = !!share?.hasPassword;
-      const hasExistingExpires = normalizeTimestampMs(share?.expiresAt || 0) > 0;
-      const hasExistingVisitorLimit = Number(share?.visitorLimit || 0) > 0;
+      const hasExistingPassword = !!currentShare?.hasPassword;
+      const hasExistingExpires = normalizeTimestampMs(currentShare?.expiresAt || 0) > 0;
+      const hasExistingVisitorLimit = Number(currentShare?.visitorLimit || 0) > 0;
       const password = passwordRaw === passwordKeepToken ? "" : passwordRaw;
       return {
         password,
-        clearPassword: !!share && hasExistingPassword && passwordRaw === "",
+        clearPassword: !!currentShare && hasExistingPassword && passwordRaw === "",
         expiresAt,
-        clearExpires: !!share && hasExistingExpires && !expiresAt,
+        clearExpires: !!currentShare && hasExistingExpires && !expiresAt,
         visitorLimit,
-        clearVisitorLimit: !!share && hasExistingVisitorLimit && visitorRaw === "",
+        clearVisitorLimit: !!currentShare && hasExistingVisitorLimit && visitorRaw === "",
       };
     };
 
@@ -1479,32 +1615,32 @@ class SiYuanSharePlugin extends Plugin {
           }
           if (action === "update") {
             const shareId = btn.getAttribute("data-share-id");
-            const options = readShareOptions(dialog.element);
+            const options = readShareOptions(dialog.element, getShare());
             await this.updateShare(shareId, options);
-            dialog.destroy();
+            refreshDialog();
             return;
           }
           if (action === "update-access") {
             const shareId = btn.getAttribute("data-share-id");
-            const options = readShareOptions(dialog.element);
+            const options = readShareOptions(dialog.element, getShare());
             await this.updateShareAccess(shareId, options);
-            dialog.destroy();
+            refreshDialog();
             return;
           }
           if (action === "delete") {
             const shareId = btn.getAttribute("data-share-id");
             await this.deleteShare(shareId);
-            dialog.destroy();
+            refreshDialog();
             return;
           }
           if (action === "share") {
-            const options = readShareOptions(dialog.element);
+            const options = readShareOptions(dialog.element, getShare());
             if (itemType === SHARE_TYPES.NOTEBOOK) {
               await this.shareNotebook(itemId, options);
             } else {
               await this.shareDoc(itemId, options);
             }
-            dialog.destroy();
+            refreshDialog();
           }
         } catch (err) {
           this.showErr(err);
@@ -1512,7 +1648,21 @@ class SiYuanSharePlugin extends Plugin {
       })();
     };
 
-    const dialog = new Dialog({
+    let dialog = null;
+    const attachCopyFocus = () => {
+      const input = dialog?.element?.querySelector?.("input.b3-text-field[readonly]");
+      if (input) {
+        input.addEventListener("focus", () => input.select());
+      }
+    };
+    const refreshDialog = () => {
+      const contentEl = dialog?.element?.querySelector?.(".sps-share-dialog-content");
+      if (!contentEl) return;
+      contentEl.innerHTML = renderContent();
+      attachCopyFocus();
+    };
+
+    dialog = new Dialog({
       title: t("siyuanShare.title.shareManagement"),
       content,
       width: "min(720px, 92vw)",
@@ -1522,11 +1672,7 @@ class SiYuanSharePlugin extends Plugin {
     });
 
     dialog.element.addEventListener("click", onClick);
-
-    const input = dialog.element.querySelector("input.b3-text-field[readonly]");
-    if (input) {
-      input.addEventListener("focus", () => input.select());
-    }
+    attachCopyFocus();
   }
 
   startSettingLayoutObserver() {
@@ -1583,6 +1729,23 @@ class SiYuanSharePlugin extends Plugin {
     const {currentWrap, sharesWrap} = this.settingEls || {};
     this.makeSettingRowFullWidth(currentWrap);
     this.makeSettingRowFullWidth(sharesWrap);
+    this.alignSettingSiteSelectWidth();
+  }
+
+  alignSettingSiteSelectWidth() {
+    const {siteSelect, siteNameInput, siteInput, apiKeyInput} = this.settingEls || {};
+    if (!siteSelect) return;
+    const ref =
+      (siteNameInput && siteNameInput.isConnected && siteNameInput) ||
+      (siteInput && siteInput.isConnected && siteInput) ||
+      (apiKeyInput && apiKeyInput.isConnected && apiKeyInput) ||
+      null;
+    if (!ref) return;
+    const rect = ref.getBoundingClientRect();
+    const width = Math.round(rect?.width || 0);
+    if (!Number.isFinite(width) || width <= 0) return;
+    siteSelect.style.width = `${width}px`;
+    siteSelect.style.maxWidth = `${width}px`;
   }
 
   onDockClick = (event) => {
@@ -1952,10 +2115,42 @@ class SiYuanSharePlugin extends Plugin {
 
   async loadState() {
     const settings = (await this.loadData(STORAGE_SETTINGS)) || {};
-    const shares = (await this.loadData(STORAGE_SHARES)) || [];
+    const legacyShares = (await this.loadData(STORAGE_SHARES)) || [];
+    const siteSharesRaw = (await this.loadData(STORAGE_SITE_SHARES)) || {};
+    const siteShares =
+      siteSharesRaw && typeof siteSharesRaw === "object" && !Array.isArray(siteSharesRaw) ? siteSharesRaw : {};
+    let sites = this.normalizeSiteList(settings.sites);
+    let activeSiteId = String(settings.activeSiteId || "");
+    let persistSettings = false;
+    if (!sites.length && (settings.siteUrl || settings.apiKey)) {
+      const fallback = {
+        id: randomSlug(10),
+        name: this.resolveSiteName("", settings.siteUrl || "", 0),
+        siteUrl: String(settings.siteUrl || "").trim(),
+        apiKey: String(settings.apiKey || "").trim(),
+      };
+      sites.push(fallback);
+      activeSiteId = fallback.id;
+      persistSettings = true;
+    }
+    if (activeSiteId && !sites.find((site) => String(site.id) === activeSiteId)) {
+      activeSiteId = "";
+      persistSettings = true;
+    }
+    if (!activeSiteId && sites.length) {
+      activeSiteId = String(sites[0].id || "");
+      persistSettings = true;
+    }
+    const activeSite = sites.find((site) => String(site.id) === activeSiteId) || null;
+    let persistShares = false;
+    if (Array.isArray(legacyShares) && legacyShares.length && activeSiteId && !siteShares[activeSiteId]) {
+      siteShares[activeSiteId] = legacyShares;
+      persistShares = true;
+    }
+    this.siteShares = siteShares;
     this.settings = {
-      siteUrl: settings.siteUrl || "",
-      apiKey: settings.apiKey || "",
+      siteUrl: activeSite?.siteUrl || "",
+      apiKey: activeSite?.apiKey || "",
       uploadAssetConcurrency: normalizePositiveInt(
         settings.uploadAssetConcurrency,
         DEFAULT_UPLOAD_ASSET_CONCURRENCY,
@@ -1964,10 +2159,11 @@ class SiYuanSharePlugin extends Plugin {
         settings.uploadChunkConcurrency,
         DEFAULT_UPLOAD_CHUNK_CONCURRENCY,
       ),
+      sites,
+      activeSiteId,
     };
-    this.shares = Array.isArray(shares)
-      ? shares.filter((s) => s && s.id && s.type)
-      : [];
+    const activeShares = activeSiteId ? this.siteShares[activeSiteId] : null;
+    this.shares = Array.isArray(activeShares) ? activeShares.filter((s) => s && s.id && s.type) : [];
     this.hasNodeFs = !!(fs && path);
     this.workspaceDir = "";
     this.syncSettingInputs();
@@ -1975,13 +2171,39 @@ class SiYuanSharePlugin extends Plugin {
     this.renderDock();
     this.updateTopBarState();
     void this.refreshCurrentDocContext();
+    if (persistSettings) {
+      await this.saveData(STORAGE_SETTINGS, this.settings);
+    }
+    if (persistShares) {
+      await this.saveData(STORAGE_SITE_SHARES, this.siteShares);
+    }
   }
 
   initSettingPanel() {
     const t = this.t.bind(this);
+    const siteSelect = document.createElement("select");
+    siteSelect.className = "b3-select sps-site-select sps-site-select--setting";
+    siteSelect.addEventListener("change", this.onSiteSelectChange);
+
+    const siteNameInput = document.createElement("input");
+    siteNameInput.className = "b3-text-field fn__block";
+    siteNameInput.placeholder = t("siyuanShare.label.siteName");
+
+    const siteActions = document.createElement("div");
+    siteActions.className = "siyuan-plugin-share__actions";
+    siteActions.innerHTML = `
+  <button class="b3-button b3-button--outline" data-action="site-add">${t(
+    "siyuanShare.action.addSite",
+  )}</button>
+  <button class="b3-button b3-button--outline" data-action="site-remove">${t(
+    "siyuanShare.action.removeSite",
+  )}</button>
+`;
+    siteActions.addEventListener("click", this.onSettingSitesClick);
+
     const siteInput = document.createElement("input");
     siteInput.className = "b3-text-field fn__block";
-    siteInput.placeholder = "https://example.com";
+    siteInput.placeholder = t("siyuanShare.placeholder.siteUrl");
 
     const apiKeyInput = document.createElement("input");
     apiKeyInput.className = "b3-text-field fn__block";
@@ -2002,6 +2224,8 @@ class SiYuanSharePlugin extends Plugin {
     this.settingEls = {
       siteInput,
       apiKeyInput,
+      siteSelect,
+      siteNameInput,
       currentWrap,
       sharesWrap,
       envHint,
@@ -2010,6 +2234,24 @@ class SiYuanSharePlugin extends Plugin {
     this.setting = new Setting({
       width: "92vw",
       height: "80vh",
+    });
+
+    this.setting.addItem({
+      title: t("siyuanShare.label.site"),
+      description: t("siyuanShare.hint.siteList"),
+      createActionElement: () => siteSelect,
+    });
+
+    this.setting.addItem({
+      title: t("siyuanShare.label.siteName"),
+      description: "",
+      createActionElement: () => siteNameInput,
+    });
+
+    this.setting.addItem({
+      title: t("siyuanShare.label.siteActions"),
+      description: "",
+      createActionElement: () => siteActions,
     });
 
     this.setting.addItem({
@@ -2068,10 +2310,73 @@ class SiYuanSharePlugin extends Plugin {
     this.startSettingLayoutObserver();
   }
 
+  resolveSiteName(name, siteUrl, fallbackIndex = 0) {
+    const trimmed = String(name || "").trim();
+    if (trimmed) return trimmed;
+    const host = getUrlHost(siteUrl);
+    if (host) return host;
+    const url = String(siteUrl || "").trim();
+    if (url) return url;
+    return `${this.t("siyuanShare.label.site")} ${fallbackIndex + 1}`;
+  }
+
+  normalizeSiteList(rawSites) {
+    const sites = [];
+    const seen = new Set();
+    if (!Array.isArray(rawSites)) return sites;
+    rawSites.forEach((raw) => {
+      if (!raw || typeof raw !== "object") return;
+      let id = String(raw.id || "").trim();
+      if (!id || seen.has(id)) {
+        id = randomSlug(10);
+      }
+      const siteUrl = String(raw.siteUrl || "").trim();
+      const apiKey = String(raw.apiKey || "").trim();
+      const name = this.resolveSiteName(raw.name, siteUrl, sites.length);
+      sites.push({id, name, siteUrl, apiKey});
+      seen.add(id);
+    });
+    return sites;
+  }
+
+  getActiveSite() {
+    const sites = Array.isArray(this.settings.sites) ? this.settings.sites : [];
+    const activeId = String(this.settings.activeSiteId || "");
+    return sites.find((site) => site && String(site.id) === activeId) || sites[0] || null;
+  }
+
+  getSiteOptionLabel(site, index = 0) {
+    if (!site) return `${this.t("siyuanShare.label.site")} ${index + 1}`;
+    const name = this.resolveSiteName(site.name, site.siteUrl, index);
+    const host = getUrlHost(site.siteUrl);
+    if (host && host !== name) {
+      return `${name} (${host})`;
+    }
+    return name || host || `${this.t("siyuanShare.label.site")} ${index + 1}`;
+  }
+
   syncSettingInputs() {
-    const {siteInput, apiKeyInput, envHint} = this.settingEls || {};
+    const {siteInput, apiKeyInput, envHint, siteSelect, siteNameInput} = this.settingEls || {};
     if (siteInput) siteInput.value = this.settings.siteUrl || "";
     if (apiKeyInput) apiKeyInput.value = this.settings.apiKey || "";
+    if (siteSelect) {
+      const sites = Array.isArray(this.settings.sites) ? this.settings.sites : [];
+      const activeId = String(this.settings.activeSiteId || "");
+      siteSelect.innerHTML = "";
+      sites.forEach((site, index) => {
+        const option = document.createElement("option");
+        option.value = String(site.id || "");
+        option.textContent = this.getSiteOptionLabel(site, index);
+        siteSelect.appendChild(option);
+      });
+      if (activeId) {
+        siteSelect.value = activeId;
+      }
+    }
+    if (siteNameInput) {
+      const active = this.getActiveSite();
+      siteNameInput.value = active?.name || "";
+    }
     if (envHint) {
       const t = this.t.bind(this);
       const base = normalizeUrlBase(this.settings.siteUrl);
@@ -2094,26 +2399,213 @@ class SiYuanSharePlugin extends Plugin {
     }
   }
 
+  persistCurrentSiteInputs() {
+    const {siteInput, apiKeyInput, siteNameInput} = this.settingEls || {};
+    const siteUrl = (siteInput?.value || "").trim();
+    const apiKey = (apiKeyInput?.value || "").trim();
+    const siteName = (siteNameInput?.value || "").trim();
+    let sites = this.normalizeSiteList(this.settings.sites);
+    let activeSiteId = String(this.settings.activeSiteId || "");
+    let activeSite = sites.find((site) => String(site.id) === activeSiteId);
+    if (!activeSite && (siteUrl || apiKey || siteName)) {
+      activeSiteId = activeSiteId || randomSlug(10);
+      activeSite = {
+        id: activeSiteId,
+        name: this.resolveSiteName(siteName, siteUrl, sites.length),
+        siteUrl,
+        apiKey,
+      };
+      sites.push(activeSite);
+    } else if (activeSite) {
+      activeSite.siteUrl = siteUrl;
+      activeSite.apiKey = apiKey;
+      activeSite.name = this.resolveSiteName(siteName || activeSite.name, siteUrl, sites.indexOf(activeSite));
+    }
+    this.settings = {
+      ...this.settings,
+      siteUrl,
+      apiKey,
+      sites,
+      activeSiteId,
+    };
+    return {siteUrl, apiKey, siteName, sites, activeSiteId};
+  }
+
+  async applyActiveSite(siteId, {persist = true} = {}) {
+    const sites = this.normalizeSiteList(this.settings.sites);
+    const next = sites.find((site) => String(site.id) === String(siteId)) || sites[0] || null;
+    const activeSiteId = next ? String(next.id) : "";
+    this.settings = {
+      ...this.settings,
+      sites,
+      activeSiteId,
+      siteUrl: next?.siteUrl || "",
+      apiKey: next?.apiKey || "",
+    };
+    this.remoteUser = null;
+    this.remoteVerifiedAt = 0;
+    this.remoteUploadLimits = null;
+    this.shares = Array.isArray(this.siteShares?.[activeSiteId]) ? this.siteShares[activeSiteId] : [];
+    if (persist) {
+      await this.saveData(STORAGE_SETTINGS, this.settings);
+    }
+    this.syncSettingInputs();
+    this.renderDock();
+    this.renderSettingCurrent();
+    this.renderSettingShares();
+    this.updateTopBarState();
+  }
+
   saveSettingsFromSetting = async ({notify = true} = {}) => {
     const t = this.t.bind(this);
-    const {siteInput, apiKeyInput} = this.settingEls;
-    const next = {
-      ...this.settings,
-      siteUrl: (siteInput?.value || "").trim(),
-      apiKey: (apiKeyInput?.value || "").trim(),
-    };
-    this.settings = next;
-    await this.saveData(STORAGE_SETTINGS, next);
-    if (!next.siteUrl || !next.apiKey) {
+    this.persistCurrentSiteInputs();
+    this.shares = Array.isArray(this.siteShares?.[this.settings.activeSiteId])
+      ? this.siteShares[this.settings.activeSiteId]
+      : [];
+    await this.saveData(STORAGE_SETTINGS, this.settings);
+    if (!this.settings.siteUrl || !this.settings.apiKey) {
       this.shares = [];
-      await this.saveData(STORAGE_SHARES, this.shares);
+      if (this.settings.activeSiteId) {
+        this.siteShares[this.settings.activeSiteId] = [];
+        await this.saveData(STORAGE_SITE_SHARES, this.siteShares);
+      }
     }
     this.remoteUser = null;
     this.remoteVerifiedAt = 0;
+    this.remoteUploadLimits = null;
     this.renderDock();
     this.renderSettingShares();
     this.syncSettingInputs();
     if (notify) this.notify(t("siyuanShare.message.disconnected"));
+  };
+
+  onSiteSelectChange = (event) => {
+    const nextId = String(event?.target?.value || "");
+    if (!nextId || String(this.settings.activeSiteId || "") === nextId) return;
+    void (async () => {
+      try {
+        this.persistCurrentSiteInputs();
+        await this.applyActiveSite(nextId, {persist: false});
+        await this.saveData(STORAGE_SETTINGS, this.settings);
+      } catch (err) {
+        this.showErr(err);
+      }
+    })();
+  };
+
+  onDockChange = (event) => {
+    const target = event.target;
+    if (!target || target.id !== "sps-site-select") return;
+    const nextId = String(target.value || "");
+    if (!nextId || String(this.settings.activeSiteId || "") === nextId) return;
+    void (async () => {
+      try {
+        const siteUrl = this.getInputValue("sps-site").trim();
+        const apiKey = this.getInputValue("sps-apikey").trim();
+        let sites = this.normalizeSiteList(this.settings.sites);
+        let activeSiteId = String(this.settings.activeSiteId || "");
+        let activeSite = sites.find((site) => String(site.id) === activeSiteId);
+        if (!activeSite && (siteUrl || apiKey)) {
+          activeSiteId = activeSiteId || randomSlug(10);
+          activeSite = {
+            id: activeSiteId,
+            name: this.resolveSiteName("", siteUrl, sites.length),
+            siteUrl,
+            apiKey,
+          };
+          sites.push(activeSite);
+        } else if (activeSite) {
+          activeSite.siteUrl = siteUrl;
+          activeSite.apiKey = apiKey;
+          activeSite.name = this.resolveSiteName(activeSite.name, siteUrl, sites.indexOf(activeSite));
+        }
+        this.settings = {
+          ...this.settings,
+          sites,
+          siteUrl,
+          apiKey,
+          activeSiteId,
+        };
+        await this.applyActiveSite(nextId, {persist: true});
+      } catch (err) {
+        this.showErr(err);
+      }
+    })();
+  };
+
+  onSettingSitesClick = (event) => {
+    const btn = event.target.closest("[data-action]");
+    if (!btn) return;
+    const action = btn.getAttribute("data-action");
+    if (!action) return;
+    void (async () => {
+      try {
+        if (action === "site-add") {
+          this.persistCurrentSiteInputs();
+          const sites = this.normalizeSiteList(this.settings.sites);
+          const newSiteId = randomSlug(10);
+          const newSite = {
+            id: newSiteId,
+            name: this.resolveSiteName("", "", sites.length),
+            siteUrl: "",
+            apiKey: "",
+          };
+          sites.push(newSite);
+          this.settings = {
+            ...this.settings,
+            sites,
+            activeSiteId: newSiteId,
+            siteUrl: "",
+            apiKey: "",
+          };
+          this.siteShares[newSiteId] = this.siteShares[newSiteId] || [];
+          this.shares = this.siteShares[newSiteId];
+          this.remoteUser = null;
+          this.remoteVerifiedAt = 0;
+          this.remoteUploadLimits = null;
+          await this.saveData(STORAGE_SETTINGS, this.settings);
+          await this.saveData(STORAGE_SITE_SHARES, this.siteShares);
+          this.syncSettingInputs();
+          this.renderDock();
+          this.renderSettingCurrent();
+          this.renderSettingShares();
+          this.updateTopBarState();
+          return;
+        }
+        if (action === "site-remove") {
+          const activeId = String(this.settings.activeSiteId || "");
+          if (!activeId) return;
+          const sites = this.normalizeSiteList(this.settings.sites).filter(
+            (site) => String(site.id) !== activeId,
+          );
+          if (this.siteShares?.[activeId]) {
+            delete this.siteShares[activeId];
+          }
+          const nextSite = sites[0] || null;
+          this.settings = {
+            ...this.settings,
+            sites,
+            activeSiteId: nextSite?.id || "",
+            siteUrl: nextSite?.siteUrl || "",
+            apiKey: nextSite?.apiKey || "",
+          };
+          this.shares = nextSite?.id && this.siteShares?.[nextSite.id] ? this.siteShares[nextSite.id] : [];
+          this.remoteUser = null;
+          this.remoteVerifiedAt = 0;
+          this.remoteUploadLimits = null;
+          await this.saveData(STORAGE_SETTINGS, this.settings);
+          await this.saveData(STORAGE_SITE_SHARES, this.siteShares);
+          this.syncSettingInputs();
+          this.renderDock();
+          this.renderSettingCurrent();
+          this.renderSettingShares();
+          this.updateTopBarState();
+          return;
+        }
+      } catch (err) {
+        this.showErr(err);
+      }
+    })();
   };
 
   onSettingActionsClick = (event) => {
@@ -2339,19 +2831,45 @@ class SiYuanSharePlugin extends Plugin {
 
 
   async saveSettingsFromUI() {
-    const next = {
+    const siteUrl = this.getInputValue("sps-site").trim();
+    const apiKey = this.getInputValue("sps-apikey").trim();
+    const siteSelectId = this.getInputValue("sps-site-select").trim();
+    let sites = this.normalizeSiteList(this.settings.sites);
+    let activeSiteId = siteSelectId || String(this.settings.activeSiteId || "");
+    let activeSite = sites.find((site) => String(site.id) === activeSiteId);
+    if (!activeSite && (siteUrl || apiKey)) {
+      activeSiteId = activeSiteId || randomSlug(10);
+      activeSite = {
+        id: activeSiteId,
+        name: this.resolveSiteName("", siteUrl, sites.length),
+        siteUrl,
+        apiKey,
+      };
+      sites.push(activeSite);
+    } else if (activeSite) {
+      activeSite.siteUrl = siteUrl;
+      activeSite.apiKey = apiKey;
+      activeSite.name = this.resolveSiteName(activeSite.name, siteUrl, sites.indexOf(activeSite));
+    }
+    this.settings = {
       ...this.settings,
-      siteUrl: this.getInputValue("sps-site").trim(),
-      apiKey: this.getInputValue("sps-apikey").trim(),
+      siteUrl,
+      apiKey,
+      sites,
+      activeSiteId,
     };
-    this.settings = next;
-    await this.saveData(STORAGE_SETTINGS, next);
-    if (!next.siteUrl || !next.apiKey) {
+    this.shares = Array.isArray(this.siteShares?.[activeSiteId]) ? this.siteShares[activeSiteId] : [];
+    await this.saveData(STORAGE_SETTINGS, this.settings);
+    if (!this.settings.siteUrl || !this.settings.apiKey) {
       this.shares = [];
-      await this.saveData(STORAGE_SHARES, this.shares);
+      if (activeSiteId) {
+        this.siteShares[activeSiteId] = [];
+        await this.saveData(STORAGE_SITE_SHARES, this.siteShares);
+      }
     }
     this.remoteUser = null;
     this.remoteVerifiedAt = 0;
+    this.remoteUploadLimits = null;
     this.syncSettingInputs();
     this.renderDock();
     this.renderSettingShares();
@@ -2393,7 +2911,8 @@ class SiYuanSharePlugin extends Plugin {
     const min = normalizePositiveInt(raw.minChunkSize, UPLOAD_CHUNK_MIN_SIZE);
     const max = normalizePositiveInt(raw.maxChunkSize, UPLOAD_CHUNK_MAX_SIZE);
     const safeMin = Math.max(1, Math.min(min, max));
-    const safeMax = Math.max(safeMin, max);
+    const cappedMax = Math.min(max, UPLOAD_CHUNK_HARD_MAX_SIZE);
+    const safeMax = Math.max(safeMin, cappedMax);
     return {minChunkSize: safeMin, maxChunkSize: safeMax};
   }
 
@@ -2402,7 +2921,8 @@ class SiYuanSharePlugin extends Plugin {
     const min = normalizePositiveInt(remote.minChunkSize, UPLOAD_CHUNK_MIN_SIZE);
     const max = normalizePositiveInt(remote.maxChunkSize, UPLOAD_CHUNK_MAX_SIZE);
     const safeMin = Math.max(1, Math.min(min, max));
-    const safeMax = Math.max(safeMin, max);
+    const cappedMax = Math.min(max, UPLOAD_CHUNK_HARD_MAX_SIZE);
+    const safeMax = Math.max(safeMin, cappedMax);
     return {min: safeMin, max: safeMax};
   }
 
@@ -2424,7 +2944,7 @@ class SiYuanSharePlugin extends Plugin {
     this.uploadTuner = tuner;
   }
 
-  getAdaptiveAssetConcurrency(totalBytes, totalAssets, maxConcurrency) {
+  getAdaptiveAssetConcurrency(totalBytes, totalAssets, maxConcurrency, sizes = []) {
     const limit = normalizePositiveInt(maxConcurrency, DEFAULT_UPLOAD_ASSET_CONCURRENCY);
     const total = Math.max(1, Number(totalAssets) || 1);
     if (total <= 1) return 1;
@@ -2432,14 +2952,46 @@ class SiYuanSharePlugin extends Plugin {
     const avgSize = Number.isFinite(size) && total > 0 ? size / total : 0;
     const speed = this.getUploadSpeedBps();
     let concurrency = 1;
-    if (total >= 20) {
+    if (total >= 100) {
+      concurrency = 8;
+    } else if (total >= 50) {
+      concurrency = 6;
+    } else if (total >= 20) {
       concurrency = 4;
     } else if (total >= 10) {
       concurrency = 3;
     } else if (total >= 4) {
       concurrency = 2;
     }
-    if (avgSize > 0) {
+    const filteredSizes = Array.isArray(sizes) ? sizes.filter((s) => Number.isFinite(s) && s > 0) : [];
+    if (filteredSizes.length > 0) {
+      const sorted = filteredSizes.slice().sort((a, b) => a - b);
+      const mid = sorted[Math.floor(sorted.length * 0.5)] || 0;
+      const p90 = sorted[Math.floor(sorted.length * 0.9)] || mid;
+      const max = sorted[sorted.length - 1] || mid;
+      if (mid > 0) {
+        if (mid <= 128 * 1024) {
+          concurrency = Math.max(concurrency, 8);
+        } else if (mid <= 256 * 1024) {
+          concurrency = Math.max(concurrency, 6);
+        } else if (mid <= 512 * 1024) {
+          concurrency = Math.max(concurrency, 4);
+        } else if (mid <= 2 * MB) {
+          concurrency = Math.max(concurrency, 3);
+        } else if (mid <= 8 * MB) {
+          concurrency = Math.max(concurrency, 2);
+        }
+      }
+      if (p90 >= 32 * MB) {
+        concurrency = Math.min(concurrency, 3);
+      }
+      if (max >= 64 * MB) {
+        concurrency = Math.min(concurrency, 2);
+      }
+      if (max >= 128 * MB) {
+        concurrency = 1;
+      }
+    } else if (avgSize > 0) {
       if (avgSize <= 512 * 1024) {
         concurrency = Math.max(concurrency, 4);
       } else if (avgSize <= 2 * MB) {
@@ -2447,18 +2999,20 @@ class SiYuanSharePlugin extends Plugin {
       } else if (avgSize <= 8 * MB) {
         concurrency = Math.max(concurrency, 2);
       }
+      if (avgSize >= 128 * MB) {
+        concurrency = Math.min(concurrency, 1);
+      } else if (avgSize >= 64 * MB) {
+        concurrency = Math.min(concurrency, 2);
+      }
     }
-    if (speed >= 8 * MB) {
-      concurrency = Math.max(concurrency, 4);
+    if (speed >= 12 * MB) {
+      concurrency = Math.max(concurrency, 6);
+    } else if (speed >= 8 * MB) {
+      concurrency = Math.max(concurrency, 5);
     } else if (speed >= 4 * MB) {
-      concurrency = Math.max(concurrency, 3);
+      concurrency = Math.max(concurrency, 4);
     } else if (speed >= 2 * MB) {
-      concurrency = Math.max(concurrency, 2);
-    }
-    if (avgSize >= 128 * MB) {
-      concurrency = Math.min(concurrency, 1);
-    } else if (avgSize >= 64 * MB) {
-      concurrency = Math.min(concurrency, 2);
+      concurrency = Math.max(concurrency, 3);
     }
     return Math.min(limit, concurrency, total);
   }
@@ -2522,55 +3076,116 @@ class SiYuanSharePlugin extends Plugin {
     return Math.min(limit, concurrency, totalChunks);
   }
 
-  formatUploadDetail(uploaded, total) {
+  formatUploadDetail(uploaded, total, assetDone = null, assetTotal = null) {
+    const hasAssets = Number.isFinite(assetDone) && Number.isFinite(assetTotal) && assetTotal > 0;
+    if (hasAssets) {
+      return this.t("siyuanShare.progress.uploadedAssetsBytes", {
+        current: Math.min(assetTotal, Math.max(0, Math.floor(assetDone))),
+        total: Math.max(1, Math.floor(assetTotal)),
+        bytesCurrent: formatBytes(uploaded),
+        bytesTotal: formatBytes(total),
+      });
+    }
     return this.t("siyuanShare.progress.uploadedBytes", {
       current: formatBytes(uploaded),
       total: formatBytes(total),
     });
   }
 
+  getUploadPercent(tracker) {
+    if (!tracker) return null;
+    const hasAssets = Number.isFinite(tracker.totalAssets) && tracker.totalAssets > 0;
+    const hasBytes = Number.isFinite(tracker.totalBytes) && tracker.totalBytes > 0;
+    const assetPercent = hasAssets ? (tracker.completedAssets / tracker.totalAssets) * 100 : 0;
+    const bytePercent = hasBytes ? (tracker.uploadedBytes / tracker.totalBytes) * 100 : 0;
+    if (hasBytes) {
+      let percent = bytePercent;
+      if (hasAssets && tracker.completedAssets < tracker.totalAssets && percent >= 100) {
+        percent = 99;
+      }
+      return percent;
+    }
+    if (hasAssets) return assetPercent;
+    return null;
+  }
+
   async uploadAssetsChunked(uploadId, entries, controller, progress, totalBytes = 0) {
     const t = this.t.bind(this);
-    if (!uploadId) {
-      throw new Error(t("siyuanShare.error.remoteRequestFailed", {status: "missing upload id"}));
-    }
+        if (!uploadId) {
+          throw new Error(t("siyuanShare.error.missingUploadId"));
+        }
     if (!Array.isArray(entries) || entries.length === 0) return;
     const total = entries.length;
     const baseLabel = t("siyuanShare.progress.uploadingContent");
     const {asset: assetMax, chunk: chunkMax} = this.getUploadConcurrency();
-    const assetConcurrency = this.getAdaptiveAssetConcurrency(totalBytes, entries.length, assetMax);
-    const tracker =
-      Number.isFinite(totalBytes) && totalBytes > 0
-        ? {totalBytes, uploadedBytes: 0, label: baseLabel, started: false}
-        : null;
-    const tasks = entries.map((entry, index) => async () => {
+    const sortedEntries = entries
+      .slice()
+      .sort((a, b) => (Number(b?.asset?.blob?.size) || 0) - (Number(a?.asset?.blob?.size) || 0));
+    const sizes = sortedEntries.map((entry) => Number(entry?.asset?.blob?.size) || 0);
+    const assetConcurrency = this.getAdaptiveAssetConcurrency(totalBytes, entries.length, assetMax, sizes);
+    let fatalError = null;
+    const tracker = {
+      totalBytes: Number.isFinite(totalBytes) ? totalBytes : 0,
+      uploadedBytes: 0,
+      totalAssets: total,
+      completedAssets: 0,
+      label: baseLabel,
+      started: false,
+    };
+    const reportProgress = () => {
+      if (!progress?.update) return;
+      if (tracker.totalBytes > 0) {
+        const percent = this.getUploadPercent(tracker);
+        progress.update({
+          text: baseLabel,
+          percent,
+          detail: this.formatUploadDetail(
+            tracker.uploadedBytes,
+            tracker.totalBytes,
+            tracker.completedAssets,
+            tracker.totalAssets,
+          ),
+        });
+      } else {
+        const percent = this.getUploadPercent(tracker);
+        progress.update({text: baseLabel, percent});
+      }
+    };
+    const tasks = sortedEntries.map((entry) => async () => {
       const assetEntry = entry || {};
       const asset = assetEntry.asset || assetEntry;
       const docId = assetEntry.docId || "";
-      const suffix = total > 1 ? ` (${index + 1}/${total})` : "";
-      const label = baseLabel + suffix;
-      if (tracker) {
+      try {
         if (!tracker.started) {
           tracker.started = true;
-          progress?.update?.({
-            text: label,
-            percent: 0,
-            detail: this.formatUploadDetail(0, tracker.totalBytes),
-          });
+          reportProgress();
         }
-      } else {
-        progress?.update?.(label);
+        await this.uploadAssetInChunks(uploadId, asset, docId, controller, progress, tracker, baseLabel, chunkMax);
+        tracker.completedAssets += 1;
+        reportProgress();
+      } catch (err) {
+        if (!fatalError && !isAbortError(err)) {
+          fatalError = err;
+        }
+        if (controller && !controller.signal?.aborted) {
+          try {
+            controller.abort();
+          } catch {
+            // ignore
+          }
+        }
+        throw err;
       }
-      await this.uploadAssetInChunks(uploadId, asset, docId, controller, progress, tracker, label, chunkMax);
     });
-    await runTasksWithConcurrency(tasks, assetConcurrency);
-    if (tracker) {
-      progress?.update?.({
-        text: baseLabel,
-        percent: 100,
-        detail: this.formatUploadDetail(tracker.totalBytes, tracker.totalBytes),
-      });
+    try {
+      await runTasksWithConcurrency(tasks, assetConcurrency);
+    } catch (err) {
+      if (fatalError && isAbortError(err)) {
+        throw fatalError;
+      }
+      throw err;
     }
+    reportProgress();
   }
 
   async uploadAssetInChunks(
@@ -2605,22 +3220,40 @@ class SiYuanSharePlugin extends Plugin {
       form.append("totalSize", String(size));
       form.append("chunk", chunk, assetPath);
       const startedAt = nowTs();
-      await this.remoteRequest(REMOTE_API.shareAssetChunk, {
-        method: "POST",
-        body: form,
-        isForm: true,
-        controller,
-        progress,
-      });
+      try {
+        await withRetry(
+          () =>
+            this.remoteRequest(REMOTE_API.shareAssetChunk, {
+              method: "POST",
+              body: form,
+              isForm: true,
+              controller,
+              progress,
+            }),
+          {
+            retries: UPLOAD_RETRY_LIMIT,
+            baseDelay: UPLOAD_RETRY_BASE_DELAY,
+            maxDelay: UPLOAD_RETRY_MAX_DELAY,
+            controller,
+          },
+        );
+      } catch (err) {
+        throw err;
+      }
       const elapsed = nowTs() - startedAt;
       this.updateUploadSpeed(end - start, elapsed);
       if (tracker && tracker.totalBytes > 0) {
         tracker.uploadedBytes += end - start;
-        const percent = (tracker.uploadedBytes / tracker.totalBytes) * 100;
+        const percent = this.getUploadPercent(tracker);
         progress?.update?.({
           text: label || tracker.label,
           percent,
-          detail: this.formatUploadDetail(tracker.uploadedBytes, tracker.totalBytes),
+          detail: this.formatUploadDetail(
+            tracker.uploadedBytes,
+            tracker.totalBytes,
+            tracker.completedAssets,
+            tracker.totalAssets,
+          ),
         });
       }
     };
@@ -2726,7 +3359,7 @@ class SiYuanSharePlugin extends Plugin {
         });
         uploadId = init?.uploadId;
         if (!uploadId) {
-          throw new Error(t("siyuanShare.error.remoteRequestFailed", {status: "missing upload id"}));
+          throw new Error(t("siyuanShare.error.missingUploadId"));
         }
         const totalBytes = assetEntries.reduce(
           (sum, entry) => sum + (Number(entry.asset?.blob?.size) || 0),
@@ -2890,7 +3523,7 @@ class SiYuanSharePlugin extends Plugin {
         });
         uploadId = init?.uploadId;
         if (!uploadId) {
-          throw new Error(t("siyuanShare.error.remoteRequestFailed", {status: "missing upload id"}));
+          throw new Error(t("siyuanShare.error.missingUploadId"));
         }
         const totalBytes = assetEntries.reduce(
           (sum, entry) => sum + (Number(entry.asset?.blob?.size) || 0),
@@ -3281,7 +3914,10 @@ class SiYuanSharePlugin extends Plugin {
     });
     const shares = Array.isArray(data?.shares) ? data.shares : [];
     this.shares = shares;
-    await this.saveData(STORAGE_SHARES, shares);
+    if (this.settings.activeSiteId) {
+      this.siteShares[this.settings.activeSiteId] = shares;
+      await this.saveData(STORAGE_SITE_SHARES, this.siteShares);
+    }
     this.renderDock();
     this.renderSettingCurrent();
     this.renderSettingShares();
@@ -3303,14 +3939,18 @@ class SiYuanSharePlugin extends Plugin {
 
   async disconnectRemote() {
     const t = this.t.bind(this);
-    this.settings = {siteUrl: "", apiKey: ""};
+    const activeSiteId = String(this.settings.activeSiteId || "");
     this.remoteUser = null;
     this.remoteVerifiedAt = 0;
+    this.remoteUploadLimits = null;
     this.shares = [];
-    await this.saveData(STORAGE_SETTINGS, this.settings);
-    await this.saveData(STORAGE_SHARES, this.shares);
+    if (activeSiteId) {
+      this.siteShares[activeSiteId] = [];
+      await this.saveData(STORAGE_SITE_SHARES, this.siteShares);
+    }
     this.syncSettingInputs();
     this.renderDock();
+    this.renderSettingCurrent();
     this.renderSettingShares();
     this.updateTopBarState();
     this.notify(t("siyuanShare.message.disconnected"));
@@ -3345,55 +3985,89 @@ class SiYuanSharePlugin extends Plugin {
     const t = this.t.bind(this);
     const normalized = normalizeAssetPath(assetPath);
     if (!normalized) throw new Error(t("siyuanShare.error.resourcePathInvalid"));
-    let workspacePath = normalized;
-    if (!workspacePath.startsWith("data/")) {
-      if (workspacePath.startsWith("assets/")) {
-        workspacePath = `data/${workspacePath}`;
-      } else {
-        workspacePath = `data/${workspacePath}`;
+    const candidates = [normalized];
+    const decoded = tryDecodeAssetPath(normalized);
+    if (decoded) {
+      const decodedNormalized = normalizeAssetPath(decoded);
+      if (decodedNormalized && decodedNormalized !== normalized) {
+        candidates.push(decodedNormalized);
       }
     }
-    let resp;
-    try {
-      resp = await fetch("/api/file/getFile", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...getAuthHeaders(),
-        },
-        body: JSON.stringify({path: `/${workspacePath}`}),
-        signal: controller?.signal,
-      });
-    } catch (err) {
-      if (err?.name === "AbortError") {
-        throw new Error(t("siyuanShare.error.resourceDownloadCanceled"));
+    let lastErr = null;
+    for (const candidate of candidates) {
+      let workspacePath = candidate;
+      if (!workspacePath.startsWith("data/")) {
+        if (workspacePath.startsWith("assets/")) {
+          workspacePath = `data/${workspacePath}`;
+        } else {
+          workspacePath = `data/${workspacePath}`;
+        }
       }
-      throw err;
+      let resp;
+      try {
+        resp = await fetch("/api/file/getFile", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...getAuthHeaders(),
+          },
+          body: JSON.stringify({path: `/${workspacePath}`}),
+          signal: controller?.signal,
+        });
+      } catch (err) {
+        if (err?.name === "AbortError") {
+          throw new Error(t("siyuanShare.error.resourceDownloadCanceled"));
+        }
+        lastErr = err;
+        continue;
+      }
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => null);
+        lastErr = new Error(err?.msg || t("siyuanShare.error.resourceDownloadFailed", {status: resp.status}));
+        continue;
+      }
+      const contentType = resp.headers.get("content-type") || "";
+      if (contentType.includes("application/json")) {
+        const data = await resp.clone().json().catch(() => null);
+        if (data && typeof data.code !== "undefined" && data.code !== 0) {
+          lastErr = new Error(data?.msg || t("siyuanShare.error.resourceDownloadFailed", {status: resp.status}));
+          continue;
+        }
+      }
+      const blob = await resp.blob();
+      return {path: normalized, blob};
     }
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => null);
-      throw new Error(err?.msg || t("siyuanShare.error.resourceDownloadFailed", {status: resp.status}));
-    }
-    const blob = await resp.blob();
-    return {path: normalized, blob};
+    throw lastErr || new Error(t("siyuanShare.error.resourceDownloadFailed", {status: 500}));
   }
 
   async prepareMarkdownAssets(markdown, controller) {
     const t = this.t.bind(this);
     const cancelledMsg = t("siyuanShare.error.resourceDownloadCanceled");
-    const fixed = rewriteAssetLinks(markdown || "");
+    let fixed = rewriteAssetLinks(markdown || "");
     const assetPaths = extractAssetPaths(fixed);
     const assets = [];
     const failures = [];
+    const renameMap = new Map();
+    const usedUploadPaths = new Set();
     for (const path of assetPaths) {
       try {
         throwIfAborted(controller, t("siyuanShare.message.cancelled"));
-        assets.push(await this.fetchAssetBlob(path, controller));
+        const uploadPath = sanitizeAssetUploadPath(path, usedUploadPaths) || normalizeAssetPath(path);
+        if (uploadPath && uploadPath !== path) {
+          renameMap.set(path, uploadPath);
+        }
+        const asset = await this.fetchAssetBlob(path, controller);
+        assets.push({path: uploadPath || asset.path, blob: asset.blob});
       } catch (err) {
         if (err?.message === cancelledMsg) {
           throw err;
         }
         failures.push({path, err});
+      }
+    }
+    if (renameMap.size > 0) {
+      for (const [from, to] of renameMap) {
+        fixed = replaceAllText(fixed, from, to);
       }
     }
     if (failures.length > 0) {
@@ -3407,6 +4081,16 @@ class SiYuanSharePlugin extends Plugin {
     const t = this.t.bind(this);
     const siteUrl = this.settings.siteUrl || "";
     const apiKey = this.settings.apiKey || "";
+    const sites = Array.isArray(this.settings.sites) ? this.settings.sites : [];
+    const activeSiteId = String(this.settings.activeSiteId || "");
+    const siteOptions = sites
+      .map((site, index) => {
+        const id = String(site?.id || "");
+        const label = this.getSiteOptionLabel(site, index);
+        const selected = id && id === activeSiteId ? " selected" : "";
+        return `<option value="${escapeAttr(id)}"${selected}>${escapeHtml(label)}</option>`;
+      })
+      .join("");
     const statusLabel = !siteUrl || !apiKey
       ? t("siyuanShare.hint.needSiteAndKey")
       : this.remoteUser?.username
@@ -3460,10 +4144,14 @@ class SiYuanSharePlugin extends Plugin {
 <div class="siyuan-plugin-share__section">
   <div class="siyuan-plugin-share__title">${escapeHtml(t("siyuanShare.section.connectionSettings"))}</div>
   <div class="siyuan-plugin-share__grid">
+    <div class="siyuan-plugin-share__muted">${escapeHtml(t("siyuanShare.label.site"))}</div>
+    <select id="sps-site-select" class="b3-select sps-site-select">
+      ${siteOptions || `<option value="">${escapeHtml(t("siyuanShare.label.siteEmpty"))}</option>`}
+    </select>
     <div class="siyuan-plugin-share__muted">${escapeHtml(t("siyuanShare.label.siteUrl"))}</div>
-    <input id="sps-site" class="b3-text-field" placeholder="https://example.com" value="${escapeAttr(
-      siteUrl,
-    )}" />
+    <input id="sps-site" class="b3-text-field" placeholder="${escapeAttr(
+      t("siyuanShare.placeholder.siteUrl"),
+    )}" value="${escapeAttr(siteUrl)}" />
     <div class="siyuan-plugin-share__muted">${escapeHtml(t("siyuanShare.label.apiKey"))}</div>
     <input id="sps-apikey" type="password" class="b3-text-field" placeholder="${escapeAttr(
       t("siyuanShare.label.apiKey"),
@@ -3502,6 +4190,14 @@ class SiYuanSharePlugin extends Plugin {
   </table>
 </div>
 `;
+    try {
+      this.dockElement.removeEventListener("click", this.onDockClick);
+      this.dockElement.removeEventListener("change", this.onDockChange);
+      this.dockElement.addEventListener("click", this.onDockClick);
+      this.dockElement.addEventListener("change", this.onDockChange);
+    } catch {
+      // ignore
+    }
   }
 }
 
