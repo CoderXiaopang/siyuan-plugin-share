@@ -24,13 +24,9 @@ WORKDIR /var/www/html
 # 复制应用文件
 COPY php-site/ /var/www/html/
 
-# 创建必要的目录并设置权限
-RUN mkdir -p /var/www/html/storage \
-    && mkdir -p /var/www/html/uploads \
-    && chown -R www-data:www-data /var/www/html \
-    && chmod -R 755 /var/www/html \
-    && chmod -R 775 /var/www/html/storage \
-    && chmod -R 775 /var/www/html/uploads
+# 设置文件权限 (注意: storage 和 uploads 目录将由 docker-compose volumes 提供)
+RUN chown -R www-data:www-data /var/www/html \
+    && chmod -R 755 /var/www/html
 
 # 配置 PHP
 RUN echo "upload_max_filesize = 100M" > /usr/local/etc/php/conf.d/uploads.ini \
@@ -46,8 +42,12 @@ RUN echo '<Directory /var/www/html>' > /etc/apache2/conf-available/siyuan-share.
     && echo '</Directory>' >> /etc/apache2/conf-available/siyuan-share.conf \
     && a2enconf siyuan-share
 
+# 复制并设置 entrypoint 脚本
+COPY php-site/docker-entrypoint.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
 # 暴露端口
 EXPOSE 80
 
-# 启动 Apache
-CMD ["apache2-foreground"]
+# 使用自定义 entrypoint
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
