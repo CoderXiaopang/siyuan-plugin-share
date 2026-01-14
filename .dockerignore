@@ -1,0 +1,43 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Documentation
+README*.md
+CHANGELOG.md
+LICENSE
+
+# Plugin files (not needed for server)
+index.js
+index.css
+plugin.json
+i18n/
+icon.png
+preview.png
+
+# Docker
+docker-compose.yml
+Dockerfile
+.dockerignore
+
+# Runtime data (will be mounted as volumes)
+php-site/storage/
+php-site/uploads/
+php-site/config.php
+
+# Temporary files
+*.log
+*.tmp
+*.cache
