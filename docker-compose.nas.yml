@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: php-site/Dockerfile
+    container_name: siyuan-share-web
+    ports:
+      - "8080:80"
+    volumes:
+      # 使用 named volume 而不是 bind mount,避免 NAS 文件系统权限问题
+      - storage-data:/var/www/html/storage
+      - uploads-data:/var/www/html/uploads
+      # 配置文件仍然从主机挂载 (只读)
+      - ./php-site/config.php:/var/www/html/config.php:ro
+    environment:
+      - TZ=Asia/Shanghai
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+# 使用 named volumes 存储数据
+# Docker 会自动管理这些 volume 的权限,兼容各种 NAS 文件系统
+volumes:
+  storage-data:
+    driver: local
+  uploads-data:
+    driver: local
